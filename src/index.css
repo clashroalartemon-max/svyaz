@@ -1,0 +1,73 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #ffffff;
+  --surface: #f7f7f8;
+  --border: #e5e7eb;
+  --text: #111827;
+  --text-muted: #6b7280;
+  --accent: #3b5bdb;
+  --danger: #dc2626;
+  --own-msg: #eef2ff;
+  --other-msg: #f3f4f6;
+}
+
+[data-theme='dark'] {
+  --bg: #0f1115;
+  --surface: #161a21;
+  --border: #262b35;
+  --text: #e5e7eb;
+  --text-muted: #9099a8;
+  --accent: #5b7be8;
+  --danger: #ef4444;
+  --own-msg: #1e2a4a;
+  --other-msg: #1c2028;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+/* Мобильные браузеры: 100% считается от «большого» вьюпорта, и при появлении
+   адресной строки/клавиатуры низ уезжает за экран. dvh учитывает это. */
+@supports (height: 100dvh) {
+  html,
+  body,
+  #root {
+    height: 100dvh;
+  }
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-size: 15px;
+  -webkit-font-smoothing: antialiased;
+  -webkit-text-size-adjust: 100%;
+  overscroll-behavior-y: none;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
