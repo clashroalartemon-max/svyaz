@@ -271,7 +271,12 @@ export function CircleCaptureModal({
       <div className="flex flex-col items-center gap-3">
         <div className="relative h-[240px] w-[240px] overflow-hidden rounded-full bg-black">
           {phase !== 'preview' ? (
-            <video ref={liveRef} muted playsInline className="h-full w-full object-cover" />
+            <video
+              ref={liveRef}
+              muted
+              playsInline
+              className="h-full w-full object-cover [transform:scaleX(-1)]"
+            />
           ) : (
             <video
               src={previewUrl ?? undefined}
@@ -339,6 +344,7 @@ export function CircleCaptureModal({
 export function MessageActionsMenu({
   msg,
   own,
+  canDeleteAll,
   onReply,
   onEdit,
   onDelete,
@@ -348,6 +354,7 @@ export function MessageActionsMenu({
 }: {
   msg: Message;
   own: boolean;
+  canDeleteAll: boolean;
   onReply: () => void;
   onEdit: () => void;
   onDelete: () => void;
@@ -358,8 +365,7 @@ export function MessageActionsMenu({
   const canEdit = own && msg.type === 'text' && !msg.deleted;
   const canDelete = own && !msg.deleted;
   const canSave = !msg.deleted;
-  const canDeleteAll = onDeleteForAll !== null;
-  const deletableAll = canDeleteAll && msg.type === 'text' && !msg.deleted;
+  const deletableAll = canDeleteAll && !msg.deleted && onDeleteForAll !== null;
 
   return (
     <div className="fixed inset-0 z-[70] flex items-end justify-center bg-black/40 p-0 sm:items-center sm:p-4">

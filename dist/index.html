@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Связь — закрытая система обмена сообщениями" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>Связь — закрытая система</title>
+    <script>
+      // Применяем тему до рендера, чтобы не было вспышки неправильной темы
+      (function () {
+        try {
+          var t = localStorage.getItem('svyaz.theme');
+          var dark = t === 'dark';
+          if (t === 'system' && window.matchMedia) {
+            dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+          }
+          if (dark) document.documentElement.setAttribute('data-theme', 'dark');
+        } catch (e) {}
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-B4FnTanr.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-C_ydletw.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

@@ -110,17 +110,31 @@ function useDecryptedMedia(
       });
       return new Blob([buf], { type: stored.mimeType });
     };
+    const tryDecryptBlob = async (): Promise<Blob | null> => {
+      // Новый формат: медиа в Storage. Возвращаем расшифрованный Blob напрямую.
+      if (msg.storagePath) {
+        return db.getDecryptedMediaBlob(msg, myId);
+      }
+      return null;
+    };
     (async () => {
-      try {
-        const blob = await tryDecrypt(sender.publicKeyJwk);
+      // Приоритет: Storage (новые медиа), затем таблица media (старые сообщения).
+      const blob = (await tryDecryptBlob()) ?? null;
+      if (blob) {
         url = URL.createObjectURL(blob);
+        if (alive) setState({ url, failed: false });
+        return;
+      }
+      try {
+        const b = await tryDecrypt(sender.publicKeyJwk);
+        url = URL.createObjectURL(b);
         if (alive) setState({ url, failed: false });
       } catch {
         try {
           const fresh = await db.getUserById(msg.senderId);
           if (!fresh || !fresh.publicKeyJwk?.x) throw new Error('no key');
-          const blob = await tryDecrypt(fresh.publicKeyJwk);
-          url = URL.createObjectURL(blob);
+          const b = await tryDecrypt(fresh.publicKeyJwk);
+          url = URL.createObjectURL(b);
           if (alive) setState({ url, failed: false });
         } catch {
           if (alive) setState({ url: null, failed: true });
@@ -131,7 +145,7 @@ function useDecryptedMedia(
       alive = false;
       if (url) URL.revokeObjectURL(url);
     };
-  }, [msg.id, msg.senderId, msg.deleted, sender.publicKeyJwk, peerPublicKeyJwk, myId]);
+  }, [msg.id, msg.senderId, msg.deleted, msg.storagePath, sender.publicKeyJwk, peerPublicKeyJwk, myId]);
 
   return state;
 }
@@ -317,12 +331,30 @@ function PhotoContent({ url }: { url: string }) {
 function CircleContent({ url, duration }: { url: string; duration?: number }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [playing, setPlaying] = useState(false);
+
+  const play = async () => {
+    const v = videoRef.current;
+    if (!v) return;
+    try {
+      await v.play();
+    } catch {
+      // Если метаданные ещё не загружены — перезагружаем и пробуем снова.
+      v.load();
+      try {
+        await v.play();
+      } catch {
+        /* авто­проигрывание после тапа должно сработать повторной попыткой */
+      }
+    }
+  };
+
   const toggle = () => {
     const v = videoRef.current;
     if (!v) return;
     if (playing) v.pause();
-    else void v.play();
+    else void play();
   };
+
   return (
     <button
       type="button"
@@ -336,17 +368,23 @@ function CircleContent({ url, duration }: { url: string; duration?: number }) {
         loop
         muted
         playsInline
+        preload="auto"
+        onClick={(e) => {
+          // Сам элемент перехватывает клик внутри кнопки — дублируем toggle.
+          e.stopPropagation();
+          toggle();
+        }}
         className="h-full w-full object-cover"
         onPlay={() => setPlaying(true)}
         onPause={() => setPlaying(false)}
       />
       {!playing && (
-        <span className="absolute inset-0 flex items-center justify-center bg-black/30">
+        <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/30">
           <Play size={36} className="text-white" />
         </span>
       )}
       {duration !== undefined && (
-        <span className="absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-black/50 px-2 py-0.5 text-[13px] text-white">
+        <span className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-black/50 px-2 py-0.5 text-[13px] text-white">
           {fmtDuration(duration)}
         </span>
       )}

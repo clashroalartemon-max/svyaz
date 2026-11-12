@@ -1,0 +1,323 @@
+# Связь — закрытый мессенджер
+
+Одностраничное приложение для закрытой группы: вход по логину и паролю, личные
+чаты, текст, голосовые, фото, видео и кружки. Общая база — **Supabase
+(PostgreSQL)**, поэтому переписка синхронизируется между телефоном и компьютером.
+Сообщения и файлы шифруются на устройстве (E2EE): в базу попадает только
+шифротекст, приватные ключи не покидают браузер.
+
+Стек: React 18 + Vite + TypeScript (strict) + Tailwind CSS, React Router,
+`@supabase/supabase-js`. Сторонних UI- и крипто-библиотек нет — Web Crypto API
+и собственные компоненты.
+
+---
+
+## 1. Что нужно
+
+- Node.js 18+ и npm (проверено на Node 26).
+- Проект Supabase (бесплатного плана достаточно).
+- Аккаунты создаются автоматически: `admin` и `cadet001`…`cadet200`.
+
+## 2. Развёртывание на новом компьютере
+
+### Шаг 1. Установить зависимости
+
+```bash
+npm install
+```
+
+### Шаг 2. Создать `.env` в корне проекта
+
+Рядом с `package.json` создайте файл `.env` (образец — `.env.example`):
+
+```env
+VITE_SUPABASE_URL=https://<ваш-ref>.supabase.co
+VITE_SUPABASE_ANON_KEY=<publishable key>
+```
+
+Где взять: Supabase → ваш проект → **Project Settings → API**:
+- `Project URL` → `VITE_SUPABASE_URL`;
+- `Publishable key` (он же anon key) → `VITE_SUPABASE_ANON_KEY`.
+
+> Публикуемый ключ предназначен для браузера. **Не** кладите в `.env`
+> `service_role` — он обходит RLS и не должен попадать во фронтенд.
+> `.env` уже добавлен в `.gitignore`.
+
+### Шаг 3. Выполнить SQL
+
+Supabase → **SQL Editor → New query** → вставьте **весь** файл
+`supabase/schema.sql` → **Run**.
+
+Скрипт идемпотентен: его можно запускать повторно. Он создаёт:
+
+- таблицы `profiles`, `credentials`, `chats`, `chat_participants`, `messages`,
+  `media`, `friendships`, `read_state`, `presence`;
+- RLS-политики (чужие чаты и сообщения не видны, пароли снаружи не читаются);
+- функции `verify_login`, `change_password`, `seed_svyaz_users`;
+- **201 учётную запись**: `admin / admin12345` и `cadet001`…`cadet200 / test1234`.
+
+Если база уже была наполнена — повторный запуск ничего не задвоит.
+
+### Шаг 3а. Создать бакет для медиа (обязательно)
+
+Фото, видео, голосовые и кружки шифруются на клиенте и сохраняются в
+**Supabase Storage** (а не в PostgreSQL), чтобы база не разрослась на сотнях
+пользователей. Для этого создайте публичный бакет:
+
+1. Supabase → **Storage** (в левом меню).
+2. **New bucket** → имя **`media`** → включите **Public bucket** → **Create bucket**.
+
+> Если бакет `media` не создать, приложение автоматически вернётся к старому
+> хранению медиа в таблице `media` (работает, но быстрее заполняет базу).
+
+Get.
+
+### Шаг 4. Запустить
+
+```bash
+npm run dev
+```
+
+Откройте **http://localhost:5173**.
+
+Тестовые аккаунты:
+
+| Логин      | Пароль       | Роль    |
+|------------|--------------|---------|
+| `cadet001` | `test1234`   | курсант |
+| `cadet002` | `test1234`   | курсант |
+| `admin`    | `admin12345` | админ   |
+
+Поиск собеседника — по **точному** ФИО и номеру взвода (например,
+`Иванов Виктор Анатольевич`, `1` или `1 взвод`). Список ФИО можно посмотреть
+в Supabase → Table Editor → `profiles`.
+
+## 3. Переменные окружения
+
+| Переменная | Обязательна | Что это |
+|---|---|---|
+| `VITE_SUPABASE_URL` | да | URL проекта, `https://<ref>.supabase.co` |
+| `VITE_SUPABASE_ANON_KEY` | да | Publishable/anon key |
+
+Vite читает `.env` при старте. После изменения переменных перезапустите
+`npm run dev`.
+
+## 4. Схема данных и доступ
+
+```
+profiles            id, login, full_name, group_name, role, public_key_jwk, created_at
+credentials         profile_id → profiles, password_hash   (RLS: снаружи не читается)
+chats               id, created_at, saved, owner_id
+chat_participants   chat_id, user_id
+messages            id, chat_id, sender_id, ciphertext, iv,
+                    wrapped_key(+iv), wrapped_self_key(+iv), type,
+                    mime_type, duration, waveform, status, edited_at, deleted, created_at
+media               msg_id → messages, ciphertext, iv, wrapped_*, mime_type
+friendships         id, user_a, user_b
+read_state          user_id, chat_id, last_read_at
+presence            user_id, last_seen
+```
+
+**Как RLS узнаёт пользователя.** Клиент отправляет id вошедшего в заголовке
+`x-user-id`; функция `current_user_id()` читает его из `request.headers`.
+Политики разрешают читать только чаты, где пользователь есть в
+`chat_participants`, и писать сообщения только от своего имени.
+
+**Пароли.** На клиенте считается `SHA-256(login + ':' + password)`, в базу
+попадает только хэш. Проверка входа и смена пароля — через
+`SECURITY DEFINER`-функции `verify_login` и `change_password`: таблицу
+`credentials` нельзя прочитать или изменить напрямую через REST.
+
+## 5. Синхронизация между устройствами
+
+`src/lib/realtime.ts` открывает канал Supabase Realtime (`broadcast`):
+
+- после записи сообщения автор отправляет событие `message` с `chatId`;
+- остальные устройства получают его, перечитывают чат обычным запросом
+  (RLS не даст увидеть чужое) и обновляют ленту и список чатов;
+- `typing` — индикатор «печатает…».
+
+Почему `broadcast`, а не `postgres_changes`: у `postgres_changes` RLS
+проверяется под ролью `anon` без заголовка `x-user-id`, и строгие политики
+не отдали бы события. Broadcast идёт через websocket и не требует ослаблять RLS.
+
+`BroadcastChannel` остался только как локальная шина между вкладками одного
+браузера (`src/lib/bus.ts`) — чтобы UI обновлялся в том же окне.
+
+## 6. Как устроено шифрование
+
+`src/lib/crypto.ts`, Web Crypto API:
+
+1. При первом входе генерируется пара **ECDH P-256** с `extractable: true`.
+   Публичный ключ (JWK) хранится в `profiles.public_key_jwk`, приватный —
+   в `localStorage` под ключом `svyaz.keys.<userId>` и на сервер не уходит.
+2. Для каждого сообщения создаётся случайный ключ **AES-GCM 256**. Им
+   шифруется текст или файл — в базу попадают только `ciphertext` и `iv`.
+3. Ключ контента заворачивается дважды:
+   - `ECDH(приватный отправителя, публичный получателя)` — для получателя
+     (`wrappedKey`);
+   - `ECDH(приватный отправителя, публичный отправителя)` — для автора
+     (`wrappedSelfKey`), чтобы он читал свои сообщения.
+4. Получатель разворачивает ключ через `ECDH(свой приватный, публичный автора)` —
+   это тот же общий секрет.
+5. Если приватный ключ потерян или не совпадает с публичным, при старте пара
+   проверяется и пересоздаётся (`repairAllUserKeys()`, `ensureUserKeyPair()`).
+   Старые сообщения на потерянный ключ восстановить нельзя — это свойство E2EE.
+
+Медиа шифруются тем же конвертом **до** записи в `media`, открытый файл в базу
+не попадает.
+
+## 7. Сборка и предпросмотр
+
+```bash
+npm run build     # tsc --noEmit + vite build, результат в dist/
+npm run preview   # локальный просмотр собранной версии
+```
+
+## 8. Доступ с телефона
+
+> **Важно.** Для теста на телефоне используйте HTTPS-ссылку из `npm run tunnel`,
+> а не локальный IP. По `http://<IP>` браузер не даёт `crypto.subtle`
+> (Web Crypto доступен только в secure context), а запасной генератор ID в
+> старых версиях возвращал невалидный UUID — из-за этого и возникали белый
+> экран и ошибка `invalid input syntax for type uuid`. HTTPS всё это решает.
+
+### В одной Wi-Fi сети
+
+1. Компьютер и телефон — в одной сети.
+2. Узнайте IPv4-адрес компьютера: `ipconfig`.
+3. Откройте на телефоне `http://192.168.1.42:5173` (подставьте свой адрес).
+4. Если страница не открывается — разрешите Node.js доступ к частным сетям
+   в брандмауэре Windows.
+
+**Ограничение Web Crypto.** По `http://<IP>` браузер не даёт `crypto.subtle`,
+поэтому приложение показывает предупреждение и переходит на резервную
+JS-реализацию шифрования (медленнее, но работает). Варианты с нативным Web Crypto:
+
+- **Chrome на Android:** `chrome://flags/#unsafely-treat-insecure-origin-as-secure`
+  → добавьте `http://192.168.1.42:5173` → перезапустите браузер.
+- **HTTPS-туннель** — работает на iPhone и Android без флагов.
+
+### Через HTTPS-туннель
+
+1. `npm run build`
+2. `npm run serve` — статическая сборка на порту 4173.
+3. В отдельном терминале `npm run tunnel:prod` — ссылка вида
+   `https://xxx.trycloudflare.com`.
+
+Нюансы:
+
+- Первый запуск туннеля скачивает `cloudflared` (один раз, ~40 МБ):
+  `npx waytunnel install`.
+- Порт передаётся флагом `--port` (в waytunnel 0.1.1 позиционный аргумент
+  не поддерживается).
+- Vite 6+ блокирует внешние домены: в `vite.config.ts` стоит
+  `allowedHosts: true` для `server` и `preview`. Без этого по ссылке туннеля
+  приходит `403 Blocked request`.
+- Если `trycloudflare.com` отдаёт **530** — соединение рвёт провайдер.
+  Альтернатива без Cloudflare: `npm run tunnel:alt`
+  (ссылка `https://xxx.tunnelmole.net`).
+
+## 9. Что умеет
+
+- Вход по логину/паролю, смена пароля в настройках.
+- Чаты 1:1, непрочитанные, статусы «отправлено / доставлено / прочитано».
+- Индикатор «печатает…», зелёная точка «онлайн» (heartbeat в `presence`).
+- Текст: Enter — отправить, Shift+Enter — перенос строки, автоскролл.
+- Голосовые с волновой формой, фото (полноэкранно + «Сохранить»), видео,
+  кружки до 15 секунд с таймером.
+- Долгое нажатие на сообщение: избранное, редактирование, удаление.
+- Поиск по расшифрованному тексту текущего чата с подсветкой.
+- «Избранное» — системный чат с самим собой.
+- Экспорт истории чата в `.txt` и всех данных в `.json`.
+- Три режима темы: светлая, тёмная, системная.
+- Адаптив: на ширине < 900px одна панель, в шапке чата — «Назад».
+- Звук нового сообщения через Web Audio API (если чат не открыт).
+
+## 10. Ограничения и безопасность
+
+Это прототип для закрытой группы, а не готовый продукт для публичного релиза.
+
+- **Аутентификация клиентская.** Сервер доверяет заголовку `x-user-id`;
+  зная чужой UUID, можно выдать себя за другого. RLS защищает от случайного
+  доступа, но не от целенаправленной подделки. Для продакшена — Supabase Auth
+  (JWT, `auth.uid()` в политиках).
+- **SHA-256 без соли** для пароля уязвим к перебору по словарю. Для продакшена —
+  Argon2/bcrypt на сервере (Supabase Auth делает это сам).
+- **Приватный ключ E2EE** лежит в `localStorage` без пароля; при XSS он утечёт.
+  В продукте его место — IndexedDB с шифрованием паролем.
+- **Регистрации нет** — только предустановленные аккаунты и `createUser` в коде.
+- **Медиа в Postgres** (base64 в `media`): удобно для прототипа, но плохо
+  масштабируется. В продукте — Supabase Storage с шифрованием на клиенте.
+- **Realtime broadcast** не содержит текста сообщений — только `chatId`,
+  `messageId` и `senderId`; сам текст устройства забирают запросом под RLS.
+
+## 11. Деплой на Vercel (постоянная ссылка)
+
+Vercel даёт постоянный HTTPS-адрес вида `https://svyaz.vercel.app`, который
+работает с любого устройства и сети — в отличие от временных туннелей
+(`trycloudflare` / `tunnelmole`), где ссылка меняется и бывают ошибки 1033.
+Всё, что нужно приложению, уже в облаке Supabase, поэтому на Vercel уезжает
+только фронтенд-сборка.
+
+### Шаг 1. Переменные окружения
+
+Приложение читает Supabase из `import.meta.env` (`src/lib/supabase.ts`):
+
+- `VITE_SUPABASE_URL` — `https://<ref>.supabase.co`;
+- `VITE_SUPABASE_ANON_KEY` — publishable/anon key.
+
+Значения берутся из `Supabase → Project Settings → API`. Публикуемый ключ
+предназначен для браузера; `service_role` класть нельзя.
+
+### Шаг 2. Загрузить код на GitHub
+
+1. Создайте репозиторий на github.com (можно приватный).
+2. В корне проекта выполните:
+
+```bash
+git init
+git add .
+git commit -m "deploy svyaz"
+git branch -M main
+git remote add origin https://github.com/<ваш-логин>/svyaz.git
+git push -u origin main
+```
+
+`node_modules` и `dist` уже в `.gitignore` — в репозиторий не попадут.
+
+### Шаг 3. Импорт на Vercel
+
+1. Зайдите на vercel.com → **Add New → Project** → **Import** ваш репозиторий.
+2. Vercel сам определит фреймворк **Vite** и команду `npm run build`.
+3. В разделе **Environment Variables** добавьте (Build и Preview/Production):
+   - `VITE_SUPABASE_URL` = `https://<ref>.supabase.co`
+   - `VITE_SUPABASE_ANON_KEY` = ваш anon key
+4. Нажмите **Deploy**.
+
+`vercel.json` в корне уже содержит `rewrites: /(.*) → /index.html`, поэтому
+прямые ссылки на `/login`, `/chat/:id` и т.д. открываются без 404.
+
+### Шаг 4. Постоянная ссылка
+
+После деплоя Vercel выдаст адрес `https://svyaz.vercel.app` (имя можно сменить
+в Settings → Domains). Это и есть рабочая ссылка для телефона и компьютера.
+
+**Обновления:** после `git push` в `main` Vercel автоматически редеплоит сайт —
+туннели больше не нужны.
+
+## 12. Структура
+
+```
+src/
+  lib/        storage.ts (сессия, тема, ключи), crypto.ts (E2EE),
+              db.ts (весь доступ к Supabase), bus.ts (локальная шина),
+              realtime.ts (Supabase Realtime), seed.ts (наполнение базы),
+              supabase.ts (клиент)
+  hooks.ts    хуки сессии, темы, данных, присутствия, адаптива
+  ui/         Button, Input, Avatar, Badge, ThemeToggle
+  components/ Chat.tsx, MessageBubble.tsx, chat-modals.tsx
+  pages/      LoginPage, MainPage, FriendsPage, SettingsPage, ChatPage
+supabase/
+  schema.sql  таблицы, RLS, функции входа и серверный seed
+```

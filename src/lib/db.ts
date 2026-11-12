@@ -418,6 +418,30 @@ export async function verifyLogin(login: string, password: string): Promise<User
     }
   }
 
+  // Гарантия наличия ключа: если после входа у пользователя в базе по-прежнему
+  // нет валидного публичного ключа (например, колонка encrypted_private_key ещё
+  // не появилась в живой базе, а у seed-профиля public_key_jwk пуст), создаём
+  // свежую пару и сохраняем её — иначе с ним нельзя будет связаться.
+  if (isCryptoAvailable() && (!user.publicKeyJwk || !user.publicKeyJwk.x || !user.publicKeyJwk.y)) {
+    try {
+      const { publicKeyJwk, privateKeyJwk } = await generateUserKeys();
+      const encrypted = await encryptPrivateKeyWithPassword(
+        privateKeyJwk,
+        `${normalized}:${password}`,
+      );
+      savePrivateKey(row.id, privateKeyJwk);
+      await supabase()
+        .from('profiles')
+        .update({ encrypted_private_key: encrypted, public_key_jwk: publicKeyJwk })
+        .eq('id', row.id)
+        .then(({ error }) => {
+          if (error) console.warn('Не удалось сохранить ключ при входе', error.message);
+        });
+    } catch (error) {
+      console.warn('Не удалось сгенерировать ключ при входе', error);
+    }
+  }
+
   return user;
 }
 
@@ -713,12 +737,15 @@ interface MessageRow {
   status: MessageStatus;
   edited_at: number | null;
   deleted: boolean | null;
+  deleted_for: string[] | null;
+  storage_path: string | null;
   created_at: number | string;
 }
 
 const MESSAGE_FIELDS =
   'id,chat_id,sender_id,ciphertext,iv,wrapped_key,wrapped_key_iv,wrapped_self_key,' +
-  'wrapped_self_key_iv,reply_to_id,type,mime_type,duration,waveform,status,edited_at,deleted,created_at';
+  'wrapped_self_key_iv,reply_to_id,type,mime_type,duration,waveform,status,edited_at,deleted,' +
+  'deleted_for,storage_path,created_at';
 
 function rowToMessage(row: MessageRow): Message {
   return {
@@ -739,6 +766,8 @@ function rowToMessage(row: MessageRow): Message {
     status: row.status ?? 'sent',
     editedAt: row.edited_at ?? undefined,
     deleted: row.deleted === true,
+    deletedFor: row.deleted_for ?? undefined,
+    storagePath: row.storage_path ?? undefined,
     createdAt: Number(row.created_at ?? 0),
   };
 }
@@ -975,6 +1004,8 @@ function messageToRow(msg: Message): Record<string, unknown> {
     waveform: msg.waveform ?? null,
     reply_to_id: msg.replyToId ?? null,
     status: msg.status ?? 'sent',
+    deleted_for: msg.deletedFor ?? [],
+    storage_path: msg.storagePath ?? null,
     created_at: msg.createdAt,
     ...envelopeToRow(msg),
   };
@@ -1076,34 +1107,33 @@ export async function markChatRead(chatId: string, userId: string): Promise<void
 }
 
 /** Мягкое удаление: стираем шифротекст и медиа, оставляем «Сообщение удалено» */
-export async function softDeleteMessage(msg: Message): Promise<void> {
-  await supabase().from('media').delete().eq('msg_id', msg.id);
+/**
+ * «Удалить у себя»: сообщение скрывается только для вызывающего пользователя
+ * (добавляем его id в deleted_for), контент/медиа при этом остаются на месте —
+ * собеседник видит сообщение в обычном виде.
+ */
+export async function softDeleteMessage(msg: Message, userId: string): Promise<void> {
+  const deletedFor = Array.from(new Set([...(msg.deletedFor ?? []), userId]));
   const { error } = await supabase()
     .from('messages')
-    .update({
-      deleted: true,
-      ciphertext: '',
-      iv: '',
-      wrapped_key: null,
-      wrapped_key_iv: null,
-      wrapped_self_key: null,
-      wrapped_self_key_iv: null,
-      duration: null,
-      waveform: null,
-    })
+    .update({ deleted_for: deletedFor })
     .eq('id', msg.id);
   if (error) throw new Error(error.message);
   emit('message:updated', { messageId: msg.id, chatId: msg.chatId });
   void broadcastMessage({ chatId: msg.chatId, messageId: msg.id, kind: 'updated' });
 }
 
-/** «Удалить у всех» — доступно отправителю в течение 15 минут после отправки. */
+/**
+ * «Удалить у всех» — доступно отправителю в течение 15 минут после отправки.
+ * Удаляет и из БД, и файл из Supabase Storage (если медиа в bucket 'media').
+ */
 export async function deleteMessageForAll(msg: Message, userId: string): Promise<void> {
   if (msg.senderId !== userId) throw new Error('Удалять можно только свои сообщения');
   const elapsed = Date.now() - msg.createdAt;
   if (elapsed > 15 * 60 * 1000) throw new Error('Удалить у всех можно только в течение 15 минут после отправки');
   // Полное удаление строки — исчезает и у собеседника, и из экспорта.
   await supabase().from('media').delete().eq('msg_id', msg.id);
+  if (msg.storagePath) await deleteStoredMedia(msg.storagePath).catch(() => {});
   const { error } = await supabase().from('messages').delete().eq('id', msg.id);
   if (error) throw new Error(error.message);
   emit('message:updated', { messageId: msg.id, chatId: msg.chatId });
@@ -1187,10 +1217,12 @@ export interface MediaMessageMeta {
 /**
  * Медиа-сообщение.
  *
- * Порядок важен: RLS на media разрешает вставку только участнику чата,
- * а участником он становится по строке messages. Поэтому сначала сообщение,
- * потом файл; и только после успеха обоих — уведомление собеседнику, чтобы
- * он не открыл сообщение, у которого ещё нет медиа.
+ * Новые медиа загружаются в Supabase Storage (bucket 'media') зашифрованным
+ * файлом, в messages сохраняется storage_path. Порядок важен: RLS на media/
+ * Storage разрешает вставку только участнику чата, а участником он становится
+ * по строке messages. Поэтому сначала сообщение, потом файл; и только после
+ * успеха обоих — уведомление собеседнику, чтобы он не открыл сообщение,
+ * у которого ещё нет медиа.
  */
 export async function saveMediaMessage(
   meta: MediaMessageMeta,
@@ -1210,14 +1242,20 @@ export async function saveMediaMessage(
     ciphertext: '',
     iv: '',
   };
-  await insertMessageRow(msg);
   try {
-    await saveMedia(meta.id, { ...envelope, mimeType: meta.mimeType });
-  } catch (error) {
-    // Без медиа сообщение бесполезно — убираем, чтобы не висело пустым.
-    await supabase().from('messages').delete().eq('id', meta.id);
-    throw error;
+    // Новые медиа всегда идут в Storage; в messages кладём только ссылку.
+    const storagePath = await uploadStoredMedia(meta.id, envelope);
+    msg.storagePath = storagePath;
+  } catch {
+    // Если Storage недоступен (bucket не создан) — фолбэк на старую схему
+    // хранения в таблице media, чтобы отправка не падала целиком.
+    try {
+      await saveMedia(meta.id, { ...envelope, mimeType: meta.mimeType });
+    } catch (error) {
+      throw error;
+    }
   }
+  await insertMessageRow(msg);
   announceMessage(msg);
 }
 
@@ -1347,10 +1385,93 @@ async function downscaleAvatar(file: Blob): Promise<Blob> {
 // --- буфер: событие смены аватара ------------------------------------------------
 // Нужно emit('avatar:updated') — добавим тип события в bus.ts.
 
+// --- медиа в Supabase Storage (bucket 'media') ------------------------------------
+// Новые медиа шифруются на клиенте и загружаются в Storage как двоичный файл,
+// чтобы не раздувать базу (200 пользователей × base64 быстро съели бы бесплатные
+// 1 ГБ). В таблице messages храним только storage_path (URL), а старые сообщения
+// продолжают читаться из таблицы media (фолбэк).
+
+const MEDIA_BUCKET = 'media';
+
+function mediaPath(msgId: string): string {
+  return `chat/${msgId}.bin`;
+}
+
+/**
+ * Загрузить зашифрованное медиа в Storage. Возвращает public URL объекта.
+ * Файл двоичный (шифротекст + iv + обёрнутые ключи сложены в один буфер),
+ * имя выводится из id сообщения — перезапись безопасна (upsert).
+ */
+export async function uploadStoredMedia(msgId: string, envelope: EnvelopeFields): Promise<string> {
+  const payload = JSON.stringify({
+    v: 1,
+    ...envelope,
+  });
+  const blob = new Blob([payload], { type: 'application/octet-stream' });
+  const path = mediaPath(msgId);
+  const { error } = await supabase().storage.from(MEDIA_BUCKET).upload(path, blob, {
+    upsert: true,
+    contentType: 'application/octet-stream',
+  });
+  if (error) throw new Error(error.message);
+  const { data } = supabase().storage.from(MEDIA_BUCKET).getPublicUrl(path);
+  return data.publicUrl;
+}
+
+/** Получить URL объекта в Storage по его public URL (для скачивания). */
+function storageObjectPathFromUrl(url: string): string | null {
+  const marker = '/object/public/';
+  const idx = url.indexOf(marker);
+  if (idx === -1) return null;
+  return url.slice(idx + marker.length).replace(`${MEDIA_BUCKET}/`, '');
+}
+
+/** Удалить зашифрованный файл медиа из Storage (обратная операция к uploadStoredMedia). */
+export async function deleteStoredMedia(pathOrUrl: string): Promise<void> {
+  const path = pathOrUrl.includes('/object/public/')
+    ? (storageObjectPathFromUrl(pathOrUrl) ?? pathOrUrl)
+    : pathOrUrl;
+  if (!path) return;
+  const { error } = await supabase().storage.from(MEDIA_BUCKET).remove([path]);
+  if (error) throw new Error(error.message);
+}
+
+/**
+ * Скачать и собрать EnvelopeFields из Storage. Возвращает null, если объекта
+ * нет или он повреждён.
+ */
+export async function getStoredMediaEnvelope(pathOrUrl: string): Promise<EnvelopeFields | null> {
+  try {
+    const { data, error } = await supabase().storage.from(MEDIA_BUCKET).download(pathOrUrl);
+    if (error || !data) return null;
+    const text = await data.text();
+    const parsed = JSON.parse(text) as EnvelopeFields & { v?: number };
+    if (!parsed.ciphertext || !parsed.iv) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 /** Расшифрованное медиа в виде Blob */
 export async function getDecryptedMediaBlob(msg: Message, userId: string): Promise<Blob | null> {
+  // 1) Новый формат: медиа в Storage.
+  if (msg.storagePath) {
+    const envelope = await getStoredMediaEnvelope(msg.storagePath);
+    if (envelope) return decryptEnvelopeToBlob(msg, userId, envelope);
+    return null;
+  }
+  // 2) Старый формат: медиа в таблице media.
   const stored = await getMedia(msg.id);
   if (!stored) return null;
+  return decryptEnvelopeToBlob(msg, userId, stored);
+}
+
+async function decryptEnvelopeToBlob(
+  msg: Message,
+  userId: string,
+  envelope: EnvelopeFields,
+): Promise<Blob | null> {
   const sender = await getUserById(msg.senderId);
   if (!sender) return null;
   const peerPublicKeyJwk = await getPeerPublicKeyJwk(msg.chatId, userId);
@@ -1360,9 +1481,9 @@ export async function getDecryptedMediaBlob(msg: Message, userId: string): Promi
       own: msg.senderId === userId,
       senderPublicKeyJwk: sender.publicKeyJwk,
       peerPublicKeyJwk: peerPublicKeyJwk ?? undefined,
-      envelope: stored,
+      envelope,
     });
-    return new Blob([buf], { type: stored.mimeType });
+    return new Blob([buf], { type: msg.mimeType ?? 'application/octet-stream' });
   } catch {
     return null;
   }
@@ -1646,6 +1767,39 @@ export async function adminDeleteUser(userId: string): Promise<void> {
 export async function adminLogoutUser(userId: string): Promise<void> {
   const ok = await unwrap<boolean>(supabase().rpc('admin_logout_user', { p_profile: userId }));
   if (!ok) throw new Error('Нет прав администратора или пользователь не найден');
+}
+
+/**
+ * «Починить ключи»: сгенерировать и сохранить публичный ключ для пользователя
+ * (или для всех сразу), у кого его нет. Админ не знает пароля пользователя,
+ * поэтому приватная часть здесь не создаётся — её пользователь получит сам при
+ * следующем входе (см. verifyLogin), что сохраняет принцип E2EE. Публичного
+ * ключа достаточно, чтобы другие могли с ним связаться.
+ *
+ * Возвращает количество пользователей, которым ключ был создан.
+ */
+export async function adminFixKeys(
+  userId: string | 'all',
+): Promise<{ fixed: number; processed: number }> {
+  const targets = userId === 'all' ? await getAllUsers() : [await getUserById(userId)];
+  const valid = targets.filter((u): u is User => Boolean(u && u.id));
+
+  let fixed = 0;
+  let processed = 0;
+  for (const u of valid) {
+    const hasKey = Boolean(u.publicKeyJwk && u.publicKeyJwk.x && u.publicKeyJwk.y);
+    if (hasKey) continue;
+    processed += 1;
+    if (!isCryptoAvailable()) continue;
+    const { publicKeyJwk } = await generateUserKeys();
+    const { error } = await supabase()
+      .from('profiles')
+      .update({ public_key_jwk: publicKeyJwk })
+      .eq('id', u.id);
+    if (error) throw new Error(`Не удалось починить ключи для ${u.login}: ${error.message}`);
+    fixed += 1;
+  }
+  return { fixed, processed };
 }
 
 export function hasMyPrivateKey(userId: string): boolean {

@@ -252,10 +252,13 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
   }, [searchOpen, myId, messages]);
 
   const visibleMessages = useMemo(() => {
+    // «Удалил у себя»: сообщения, где мой id в deleted_for, из ленты убираем,
+    // у собеседника они остаются (это периферия удаления «только у себя»).
+    const base = myId ? messages.filter((m) => !(m.deletedFor ?? []).includes(myId)) : messages;
     const q = searchQuery.trim().toLowerCase();
-    if (!searchOpen || !q) return messages;
-    return messages.filter((m) => (searchIndex.get(m.id) ?? '').toLowerCase().includes(q));
-  }, [messages, searchOpen, searchQuery, searchIndex]);
+    if (!searchOpen || !q) return base;
+    return base.filter((m) => (searchIndex.get(m.id) ?? '').toLowerCase().includes(q));
+  }, [messages, myId, searchOpen, searchQuery, searchIndex]);
 
   const searchHits = useMemo(() => {
     if (!searchOpen || !searchQuery.trim()) return 0;
@@ -628,8 +631,8 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
   };
 
   const deleteMessage = async () => {
-    if (!actionMsg) return;
-    await db.softDeleteMessage(actionMsg);
+    if (!actionMsg || !myId) return;
+    await db.softDeleteMessage(actionMsg, myId);
     setActionMsg(null);
     if (editing?.id === actionMsg.id) {
       setEditing(null);
@@ -779,29 +782,43 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
           </button>
         )}
 
-        <div className="relative shrink-0">
-          <Avatar
-            name={title}
-            size="sm"
-            seed={isSaved ? `${myId}-saved` : peer.id}
-            src={isSaved ? undefined : peer.avatarUrl}
-          />
-          {!isSaved && online && (
-            <span
-              className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-bg bg-green-500"
-              title="Онлайн"
-              aria-label="Онлайн"
+        <button
+          type="button"
+          onClick={() => navigate(`/profile/${chatId}`)}
+          className="flex min-w-0 flex-1 items-center gap-3 text-left"
+          aria-label="Открыть профиль"
+        >
+          <div className="relative shrink-0">
+            <Avatar
+              name={title}
+              size="sm"
+              seed={isSaved ? `${myId}-saved` : peer.id}
+              src={isSaved ? undefined : peer.avatarUrl}
             />
-          )}
-        </div>
+            {!isSaved && online && (
+              <span
+                className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-bg bg-green-500"
+                title="Онлайн"
+                aria-label="Онлайн"
+              />
+            )}
+          </div>
+        </button>
 
         <div className="min-w-0 flex-1">
-          <div className="truncate text-[15px] font-medium text-text">{title}</div>
-          <div
-            className={`truncate text-[13px] ${peerTyping ? 'text-accent' : 'text-text-muted'}`}
+          <button
+            type="button"
+            onClick={() => navigate(`/profile/${chatId}`)}
+            className="block max-w-full text-left"
+            aria-label="Открыть профиль"
           >
-            {subtitle}
-          </div>
+            <div className="truncate text-[15px] font-medium text-text">{title}</div>
+            <div
+              className={`truncate text-[13px] ${peerTyping ? 'text-accent' : 'text-text-muted'}`}
+            >
+              {subtitle}
+            </div>
+          </button>
         </div>
 
         <button
@@ -1125,6 +1142,10 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
         <MessageActionsMenu
           msg={actionMsg}
           own={actionMsg.senderId === myId}
+          canDeleteAll={
+            actionMsg.senderId === myId &&
+            Date.now() - actionMsg.createdAt <= 15 * 60 * 1000
+          }
           onReply={() => startReply()}
           onEdit={() => void startEdit()}
           onDelete={() => void deleteMessage()}

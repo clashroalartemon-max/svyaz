@@ -1,7 +1,17 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { ArrowLeft, KeyRound, LogOut, Pencil, Save, Shield, Trash2, X } from 'lucide-react';
+import { useNavigate, Navigate } from 'react-router-dom';
+import {
+  ArrowLeft,
+  KeyRound,
+  LogOut,
+  Pencil,
+  Save,
+  Shield,
+  Trash2,
+  Wrench,
+  X,
+} from 'lucide-react';
 import * as db from '../lib/db';
 import { useAuth, useCurrentUser } from '../hooks';
 import { Avatar, Button, Input } from '../ui';
@@ -31,6 +41,9 @@ export function AdminPage() {
   const [editName, setEditName] = useState('');
   const [editGroup, setEditGroup] = useState('');
 
+  // «Починить ключи» для всех
+  const [fixingAll, setFixingAll] = useState(false);
+
   const load = useCallback(async () => {
     setError(null);
     try {
@@ -44,8 +57,10 @@ export function AdminPage() {
     void load();
   }, [load]);
 
+  const roleAdmin = myId && me && me.role === 'admin';
   if (!myId || !me) return null;
-  if (me.role !== 'admin') return null;
+  // Даже если курсант вручную введёт /admin — мгновенный редирект на главную.
+  if (!roleAdmin) return <Navigate to="/main" replace />;
 
   const filtered = users.filter(
     (u) =>
@@ -91,6 +106,11 @@ export function AdminPage() {
   };
 
   const handleDelete = async (u: User) => {
+    // Админ не может удалить сам себя (иначе система останется без права админа).
+    if (u.id === myId) {
+      setError('Нельзя удалить собственную учётную запись');
+      return;
+    }
     if (!window.confirm(`Удалить пользователя ${u.fullName} (${u.login}) со всеми данными?`)) return;
     setBusyId(u.id);
     setError(null);
@@ -120,6 +140,45 @@ export function AdminPage() {
     }
   };
 
+  const handleFixKeys = async (u: User) => {
+    setBusyId(u.id);
+    setError(null);
+    setNotice(null);
+    try {
+      const { fixed } = await db.adminFixKeys(u.id);
+      setNotice(
+        fixed > 0
+          ? `Ключи для ${u.login} созданы. Приватную часть он получит при следующем входе.`
+          : `У ${u.login} ключ уже есть.`,
+      );
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Не удалось починить ключи');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleFixKeysAll = async () => {
+    if (!window.confirm('Создать недостающие ключи для всех пользователей?')) return;
+    setFixingAll(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const { fixed, processed } = await db.adminFixKeys('all');
+      setNotice(
+        processed > 0
+          ? `Ключи созданы для ${fixed} из ${processed} пользователей без ключа.`
+          : 'У всех пользователей ключи на месте.',
+      );
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Не удалось починить ключи');
+    } finally {
+      setFixingAll(false);
+    }
+  };
+
   return (
     <div className="flex h-full flex-col bg-bg">
       <header className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-3">
@@ -138,6 +197,15 @@ export function AdminPage() {
         <span className="ml-auto rounded-md border border-accent/40 bg-accent/10 px-2 py-0.5 text-[13px] text-accent">
           {users.length} пользователей
         </span>
+        <Button
+          variant="secondary"
+          className="gap-1.5 !py-1.5 !text-[13px]"
+          disabled={fixingAll}
+          onClick={() => void handleFixKeysAll()}
+        >
+          <Wrench size={14} />
+          {fixingAll ? 'Чиню…' : 'Починить все'}
+        </Button>
       </header>
 
       <div className="mx-auto w-full max-w-2xl flex-1 space-y-4 overflow-y-auto p-4">
@@ -229,9 +297,14 @@ export function AdminPage() {
                           </span>
                         )}
                       </div>
-                      <div className="truncate text-[13px] text-text-muted">
-                        @{u.login} · {u.group}
-                      </div>
+<div className="truncate text-[13px] text-text-muted">
+                    @{u.login} · {u.group}
+                    {(!u.publicKeyJwk || !u.publicKeyJwk.x || !u.publicKeyJwk.y) && (
+                      <span className="ml-2 rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-600">
+                        нет ключа
+                      </span>
+                    )}
+                  </div>
                     </div>
                   </div>
 
@@ -271,6 +344,15 @@ export function AdminPage() {
                     >
                       <LogOut size={14} />
                       Выйти на всех устройствах
+                    </Button>
+                    <Button
+                      variant="secondary"
+                      className="gap-1.5 !py-1.5 !text-[13px]"
+                      disabled={busyId === u.id}
+                      onClick={() => void handleFixKeys(u)}
+                    >
+                      <Wrench size={14} />
+                      Починить ключи
                     </Button>
                     {u.id !== myId && (
                       <Button

@@ -52,6 +52,10 @@ export interface Message extends EnvelopeFields {
   editedAt?: number;
   /** мягкое удаление: текст/медиа стёрты, показывается «Сообщение удалено» */
   deleted?: boolean;
+  /** «Удалить у себя»: пользователи, для которых сообщение скрыто */
+  deletedFor?: string[];
+  /** ссылка на зашифрованное медиа в Supabase Storage (bucket 'media') */
+  storagePath?: string;
   /** ответ на сообщение: id исходного сообщения, на которое отвечают */
   replyToId?: string;
   createdAt: number;

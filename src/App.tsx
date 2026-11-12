@@ -13,6 +13,7 @@ import { SearchPage } from './pages/SearchPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { ChatPage } from './pages/ChatPage';
 import { AdminPage } from './pages/AdminPage';
+import { ProfilePage } from './pages/ProfilePage';
 
 function RequireAuth({ children }: { children: ReactNode }) {
   const userId = useAuth();
@@ -283,6 +284,14 @@ export function App() {
               element={
                 <RequireAuth>
                   <ChatPage />
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/profile/:id"
+              element={
+                <RequireAuth>
+                  <ProfilePage />
                 </RequireAuth>
               }
             />

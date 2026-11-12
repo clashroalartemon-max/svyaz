@@ -9,6 +9,7 @@ import {
   Monitor,
   Moon,
   Shield,
+  ShieldCheck,
   Sun,
   Upload,
 } from 'lucide-react';
@@ -354,6 +355,22 @@ export function SettingsPage() {
             )}
           </div>
         </Section>
+
+        {me.role === 'admin' && (
+          <Section
+            title="Администрирование"
+            hint="Управление пользователями, ключами и сессиями"
+          >
+            <button
+              type="button"
+              onClick={() => navigate('/admin')}
+              className="flex w-full items-center gap-2.5 rounded-lg border border-accent/40 px-3 py-2.5 text-left text-[15px] text-text hover:bg-accent/10"
+            >
+              <ShieldCheck size={16} className="text-accent" />
+              Админ-панель
+            </button>
+          </Section>
+        )}
 
         <div className="pb-6">
           <Button variant="danger" className="w-full" onClick={logout}>

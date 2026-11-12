@@ -433,7 +433,7 @@ export async function encryptFor(params: EncryptParams): Promise<EnvelopeFields>
   const myPrivateJwk = getPrivateKey(myId);
   if (!myPrivateJwk) throw new Error('Приватный ключ пользователя не найден в этом браузере');
   if (!peerPublicKeyJwk || !peerPublicKeyJwk.x || !peerPublicKeyJwk.y) {
-    throw new Error('У собеседника нет ключа шифрования');
+    throw new Error('Собеседник ещё не заходил в приложение. Попросите его войти, чтобы он получил ключи');
   }
 
   const contentKey = randomBytes(CONTENT_KEY_BYTES);
