@@ -725,6 +725,33 @@ export async function saveMessage(msg: Message): Promise<void> {
   announceMessage(msg);
 }
 
+/**
+ * Оптимистичная отправка: сразу сообщаем своему окну о новом сообщении
+ * (полный объект на руках), чтобы оно мгновенно появилось в ленте, а запись
+ * в Supabase происходит после. При ошибке сети вызывается rollback.
+ */
+export async function saveMessageOptimistic(
+  msg: Message,
+  onError?: (error: unknown) => void,
+): Promise<void> {
+  // 1. Мгновенно — в своё окно, без ожидания сети.
+  emit('message:new', { chatId: msg.chatId, message: msg });
+  emit('chat:updated', { chatId: msg.chatId });
+  void broadcastMessage({
+    chatId: msg.chatId,
+    messageId: msg.id,
+    senderId: msg.senderId,
+    kind: 'new',
+  });
+  try {
+    // 2. Пишем в базу.
+    await insertMessageRow(msg);
+  } catch (error) {
+    onError?.(error);
+    throw error;
+  }
+}
+
 /** Строка сообщения без побочных эффектов (нужна медиа-сообщениям) */
 function messageToRow(msg: Message): Record<string, unknown> {
   return {

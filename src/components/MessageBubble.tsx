@@ -38,18 +38,31 @@ function useDecryptedText(
       setState({ text: null, failed: false });
       return;
     }
+    const tryDecrypt = async (senderKey: JsonWebKey): Promise<boolean> => {
+      const text = await decryptEnvelopeToString({
+        myId,
+        own: msg.senderId === myId,
+        senderPublicKeyJwk: senderKey,
+        peerPublicKeyJwk,
+        envelope: msg,
+      });
+      if (alive) setState({ text, failed: false });
+      return true;
+    };
     (async () => {
       try {
-        const text = await decryptEnvelopeToString({
-          myId,
-          own: msg.senderId === myId,
-          senderPublicKeyJwk: sender.publicKeyJwk,
-          peerPublicKeyJwk,
-          envelope: msg,
-        });
-        if (alive) setState({ text, failed: false });
+        await tryDecrypt(sender.publicKeyJwk);
       } catch {
-        if (alive) setState({ text: null, failed: true });
+        // Повторная попытка: ключ отправителя мог обновиться в базе после того,
+        // как сообщение было отправлено (например, получатель зашёл офлайн,
+        // а ключ пересоздался). Запрашиваем свежий публичный ключ из Supabase.
+        try {
+          const fresh = await db.getUserById(msg.senderId);
+          if (!fresh || !fresh.publicKeyJwk?.x) throw new Error('no key');
+          await tryDecrypt(fresh.publicKeyJwk);
+        } catch {
+          if (alive) setState({ text: null, failed: true });
+        }
       }
     })();
     return () => {
@@ -85,22 +98,33 @@ function useDecryptedMedia(
     let alive = true;
     let url: string | null = null;
     if (msg.deleted) return;
+    const tryDecrypt = async (senderKey: JsonWebKey): Promise<Blob> => {
+      const stored = await db.getMedia(msg.id);
+      if (!stored) throw new Error('media not found');
+      const buf = await decryptEnvelope({
+        myId,
+        own: msg.senderId === myId,
+        senderPublicKeyJwk: senderKey,
+        peerPublicKeyJwk,
+        envelope: stored,
+      });
+      return new Blob([buf], { type: stored.mimeType });
+    };
     (async () => {
       try {
-        const stored = await db.getMedia(msg.id);
-        if (!stored) throw new Error('media not found');
-        const buf = await decryptEnvelope({
-          myId,
-          own: msg.senderId === myId,
-          senderPublicKeyJwk: sender.publicKeyJwk,
-          peerPublicKeyJwk,
-          envelope: stored,
-        });
-        const blob = new Blob([buf], { type: stored.mimeType });
+        const blob = await tryDecrypt(sender.publicKeyJwk);
         url = URL.createObjectURL(blob);
         if (alive) setState({ url, failed: false });
       } catch {
-        if (alive) setState({ url: null, failed: true });
+        try {
+          const fresh = await db.getUserById(msg.senderId);
+          if (!fresh || !fresh.publicKeyJwk?.x) throw new Error('no key');
+          const blob = await tryDecrypt(fresh.publicKeyJwk);
+          url = URL.createObjectURL(blob);
+          if (alive) setState({ url, failed: false });
+        } catch {
+          if (alive) setState({ url: null, failed: true });
+        }
       }
     })();
     return () => {

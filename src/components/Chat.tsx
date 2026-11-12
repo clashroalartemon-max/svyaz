@@ -23,6 +23,7 @@ import {
   useAuth,
   useChat,
   useCurrentUser,
+  useFreshKeysOnChatOpen,
   useMediaQuery,
   useMessages,
   useOnline,
@@ -142,6 +143,8 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
 
   const online = useOnline(isSaved ? null : peer?.id ?? null);
   const peerTyping = usePeerTyping(chatId, isSaved ? null : peer?.id ?? null);
+  // При открытии чата обновляем публичные ключи участников (офлайн-расшифровка).
+  useFreshKeysOnChatOpen(chatId, myId, isSaved ? null : peer?.id ?? null);
 
   const [text, setText] = useState('');
   const [menuOpen, setMenuOpen] = useState(false);
@@ -328,6 +331,20 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
     if (floodLimited()) return;
     const replyToId = replyTo?.id;
     sendingRef.current = true;
+    const optimisticId = newId();
+    const optimisticMsg: Message = {
+      id: optimisticId,
+      chatId,
+      senderId: myId,
+      type: 'text',
+      replyToId,
+      status: 'sent',
+      createdAt: Date.now(),
+      ciphertext: '',
+      iv: '',
+    };
+    // Сразу показываем сообщение в ленте (оптимистичный UI), шифруем и пишем в базу.
+    setReplyTo(null);
     try {
       const keys = await resolveKeys();
       if (!keys) throw new Error('не удалось определить участников чата');
@@ -337,17 +354,11 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
         peerPublicKeyJwk: keys.peer.publicKeyJwk,
         data: trimmed,
       });
-      await db.saveMessage({
-        id: newId(),
-        chatId,
-        senderId: myId,
-        type: 'text',
-        replyToId,
-        status: 'sent',
-        createdAt: Date.now(),
-        ...envelope,
+      const fullMsg: Message = { ...optimisticMsg, ...envelope };
+      await db.saveMessageOptimistic(fullMsg, (e) => {
+        console.error('sendText optimistic error', e);
+        alert('Не удалось отправить сообщение: нет соединения. Повторите попытку.');
       });
-      setReplyTo(null);
       scrollToBottom();
     } catch (e) {
       console.warn('sendText failed', e);

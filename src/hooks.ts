@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import * as db from './lib/db';
 import * as storage from './lib/storage';
-import { on } from './lib/bus';
+import { emit, on } from './lib/bus';
 import type { TypingPayload } from './lib/bus';
 import type { Chat, ChatListItem, Message, ThemeMode, User } from './types';
 
@@ -216,8 +216,20 @@ export function useMessages(chatId: string | null): Message[] {
     };
 
     const unsubNew = on('message:new', (payload) => {
-      const p = payload as { chatId?: string } | undefined;
-      if (!p?.chatId || p.chatId === chatId) void refresh();
+      const p = payload as
+        | { chatId?: string; message?: Message }
+        | undefined;
+      if (!p?.chatId || p.chatId !== chatId) return;
+      if (p.message) {
+        // Оптимистичный UI: новое сообщение уже на руках — добавляем сразу,
+        // без ожидания повторного запроса к базе.
+        setMessages((prev) => {
+          if (prev.some((m) => m.id === p.message!.id)) return prev;
+          return [...prev, p.message!];
+        });
+        return;
+      }
+      void refresh();
     });
     const unsubUpdated = on('message:updated', () => void refresh());
     const unsubCleared = on('chat:cleared', () => void refresh());
@@ -242,13 +254,17 @@ export interface ChatState {
 export function useChat(chatId: string | null): ChatState {
   const rev = useDataRevision();
   const [state, setState] = useState<ChatState>({ chat: null, loaded: false });
+
+  // Показываем «Загрузка…» ТОЛЬКО при смене самого чата (первичное открытие),
+  // а не при каждом обновлении ревизии (отправка/получение сообщения),
+  // чтобы не мигал экран «Загрузка…» во время переписки.
   useEffect(() => {
     if (!chatId) {
       setState({ chat: null, loaded: true });
       return;
     }
     let alive = true;
-    setState((prev) => ({ chat: prev.chat, loaded: false }));
+    setState((prev) => (prev.chat?.id === chatId ? prev : { chat: null, loaded: false }));
     db.getChatById(chatId).then((c) => {
       if (alive) setState({ chat: c, loaded: true });
     });
@@ -285,6 +301,37 @@ export function usePeer(chat: Chat | null, myId: string | null): User | null {
   }, [peerId, rev]);
 
   return peer;
+}
+
+/**
+ * При открытии чата принудительно обновляет публичные ключи участников и
+ * перечитывает профиль собеседника. Нужно для офлайн-пользователей: если
+ * ключ отправителя в базу попал/обновился, пока получатель был офлайн,
+ * лента обязана взять свежий ключ, а не застрять на «зашифровано».
+ */
+export function useFreshKeysOnChatOpen(
+  chatId: string | null,
+  myId: string | null,
+  peerId: string | null,
+): void {
+  const doneRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!chatId) return;
+    let alive = true;
+    if (doneRef.current === chatId) return;
+    doneRef.current = chatId;
+    (async () => {
+      // Обновляем пару текущего пользователя (если её нет/испорчена).
+      if (myId) await db.ensureUserKeyPair(myId).catch(() => {});
+      // Возвращаем актуальный профиль собеседника — свежий публичный ключ.
+      if (peerId) await db.getUserById(peerId).catch(() => {});
+      // Оповещаем: лента перечитает профили и ключи участников.
+      if (alive) emit('chat:updated', {});
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [chatId, myId, peerId]);
 }
 
 // --- присутствие и «печатает» -----------------------------------------------------
