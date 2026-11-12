@@ -183,6 +183,61 @@ export function savePrivateKey(userId: string, jwk: JsonWebKey): void {
   window.localStorage.setItem(keyStorageName(userId), JSON.stringify(jwk));
 }
 
+// --- переносимость ключа: шифрование приватного ключа паролем ------------------
+
+/** SHA-256 в байтах (32) — для вывода ключа шифрования из пароля */
+export async function sha256Bytes(data: Uint8Array): Promise<Uint8Array<ArrayBuffer>> {
+  if (hasWebCrypto()) {
+    // digest() принимает BufferSource — копируем в новый ArrayBuffer явно.
+    const buf = data.buffer.slice(
+      data.byteOffset,
+      data.byteOffset + data.byteLength,
+    ) as ArrayBuffer;
+    const digest = await crypto.subtle.digest('SHA-256', buf);
+    return new Uint8Array(digest);
+  }
+  return fallback.sha256(data);
+}
+
+/** 32-байтовый ключ AES-GCM из пароля пользователя (детерминированный) */
+export async function deriveKeyFromPassword(password: string): Promise<Uint8Array<ArrayBuffer>> {
+  return sha256Bytes(textEncoder.encode(password));
+}
+
+/**
+ * Зашифровать приватный ключ (JWK-строку) паролем. Формат: base64(iv || ciphertext).
+ * Соль не нужна: тот же пароль даёт тот же ключ — это осознанный компромисс для
+ * переносимости ключей между устройствами закрытой группы.
+ */
+export async function encryptPrivateKeyWithPassword(
+  privateJwk: JsonWebKey,
+  password: string,
+): Promise<string> {
+  const keyBytes = await deriveKeyFromPassword(password);
+  const iv = randomBytes(IV_BYTES);
+  const plaintext = textEncoder.encode(JSON.stringify(privateJwk));
+  const ciphertext = await aesEncryptBytes(keyBytes, iv, plaintext);
+  const out = new Uint8Array(new ArrayBuffer(iv.length + ciphertext.length));
+  out.set(iv, 0);
+  out.set(ciphertext, iv.length);
+  return toBase64(out);
+}
+
+/** Расшифровать приватный ключ из base64(iv || ciphertext) паролем пользователя */
+export async function decryptPrivateKeyWithPassword(
+  encrypted: string,
+  password: string,
+): Promise<JsonWebKey> {
+  const keyBytes = await deriveKeyFromPassword(password);
+  const data = fromBase64(encrypted);
+  const iv = data.subarray(0, IV_BYTES);
+  const ciphertext = data.subarray(IV_BYTES);
+  const plaintext = await aesDecryptBytes(keyBytes, iv, ciphertext);
+  const jwk = JSON.parse(textDecoder.decode(plaintext)) as JsonWebKey;
+  if (!jwk || typeof jwk.d !== 'string' || !jwk.d) throw new Error('Неверный ключ');
+  return sanitizePrivateJwk(jwk);
+}
+
 // --- пароли -------------------------------------------------------------------
 
 /** SHA-256 в hex: Web Crypto, при его отсутствии — резервная реализация */

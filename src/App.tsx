@@ -6,12 +6,13 @@ import * as db from './lib/db';
 import { getCryptoBackend } from './lib/crypto';
 import type { CryptoBackend } from './lib/crypto';
 import { bindRealtimeToAuth, startRealtime } from './lib/realtime';
-import { useApplyTheme, useAuth, usePresenceHeartbeat } from './hooks';
+import { useApplyTheme, useAuth, useCurrentUser, usePresenceHeartbeat } from './hooks';
 import { LoginPage } from './pages/LoginPage';
 import { MainPage } from './pages/MainPage';
 import { SearchPage } from './pages/SearchPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { ChatPage } from './pages/ChatPage';
+import { AdminPage } from './pages/AdminPage';
 
 function RequireAuth({ children }: { children: ReactNode }) {
   const userId = useAuth();
@@ -19,6 +20,17 @@ function RequireAuth({ children }: { children: ReactNode }) {
   // пользователь считается онлайн (зелёная точка у собеседника).
   usePresenceHeartbeat(userId);
   if (!userId) return <Navigate to="/login" replace />;
+  return <>{children}</>;
+}
+
+/** Доступ только для админа: обычного курсанта перенаправляем на главную. */
+function RequireAdmin({ children }: { children: ReactNode }) {
+  const userId = useAuth();
+  const me = useCurrentUser();
+  usePresenceHeartbeat(userId);
+  if (!userId) return <Navigate to="/login" replace />;
+  if (!me) return null; // профиль ещё грузится
+  if (me.role !== 'admin') return <Navigate to="/main" replace />;
   return <>{children}</>;
 }
 
@@ -272,6 +284,14 @@ export function App() {
                 <RequireAuth>
                   <ChatPage />
                 </RequireAuth>
+              }
+            />
+            <Route
+              path="/admin"
+              element={
+                <RequireAdmin>
+                  <AdminPage />
+                </RequireAdmin>
               }
             />
             <Route path="*" element={<Navigate to="/main" replace />} />

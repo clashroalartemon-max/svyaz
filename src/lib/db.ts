@@ -16,7 +16,9 @@ import { broadcastChat, broadcastMessage, sendTyping } from './realtime';
 import {
   decryptEnvelope,
   decryptEnvelopeToString,
+  decryptPrivateKeyWithPassword,
   encryptFor,
+  encryptPrivateKeyWithPassword,
   generateUserKeys,
   getKeyPairStatus,
   getPrivateKey,
@@ -119,6 +121,7 @@ interface ProfileRow {
   group_name: string;
   role: Role;
   public_key_jwk: JsonWebKey | null;
+  encrypted_private_key: string | null;
   avatar_url: string | null;
   created_at: number | string;
 }
@@ -141,7 +144,17 @@ function rowToUser(row: ProfileRow): User {
   };
 }
 
-const PROFILE_FIELDS = 'id,login,full_name,group_name,role,public_key_jwk,avatar_url,created_at';
+const PROFILE_FIELDS =
+  'id,login,full_name,group_name,role,public_key_jwk,encrypted_private_key,avatar_url,created_at';
+
+/**
+ * SELECT-поля для логина без приватного ключа собеседников: encrypted_private_key
+ * и public_key_jwk нужны только для собственного профиля при входе, раздавать их
+ * всем нельзя (это закрытые данные). Используется там, где профиль отдаётся
+ * другим пользователям (поиск, список чатов).
+ */
+const PROFILE_PUBLIC_FIELDS =
+  'id,login,full_name,group_name,role,public_key_jwk,avatar_url,created_at';
 
 export interface NewUserInput {
   login: string;
@@ -160,6 +173,15 @@ async function prepareProfile(input: NewUserInput): Promise<PreparedProfile> {
   const login = normalizeLogin(input.login);
   if (!login) throw new Error('Логин не может быть пустым');
   if (!input.password) throw new Error('Пароль не может быть пустым');
+
+  // Генерируем пару ключей ECDH и сразу шифруем приватный ключ паролем,
+  // чтобы он был переносимым между устройствами (см. encrypted_private_key).
+  const { publicKeyJwk, privateKeyJwk } = await generateUserKeys();
+  const encryptedPrivateKey = await encryptPrivateKeyWithPassword(
+    privateKeyJwk,
+    `${login}:${input.password}`,
+  );
+
   return {
     profile: {
       id: uid(),
@@ -167,13 +189,17 @@ async function prepareProfile(input: NewUserInput): Promise<PreparedProfile> {
       full_name: input.fullName.trim(),
       group_name: input.group.trim(),
       role: input.role,
-      public_key_jwk: null,
+      public_key_jwk: publicKeyJwk,
+      encrypted_private_key: encryptedPrivateKey,
       avatar_url: null,
       created_at: Date.now(),
     },
     passwordHash: await hashPassword(login, input.password),
   };
 }
+
+// Пакетный seed (createUsersBatch) использует ту же prepareProfile, которая теперь
+// генерирует ключи и шифрует приватную часть паролем.
 
 export async function createUser(input: NewUserInput): Promise<User> {
   const { profile, passwordHash } = await prepareProfile(input);
@@ -272,7 +298,7 @@ export async function getAllUsers(): Promise<User[]> {
     const rows = (await unwrap(
       supabase()
         .from('profiles')
-        .select(PROFILE_FIELDS)
+        .select(PROFILE_PUBLIC_FIELDS)
         .order('created_at', { ascending: true })
         .order('id', { ascending: true })
         .range(from, from + PROFILES_PAGE_SIZE - 1),
@@ -297,7 +323,7 @@ export async function findUserByLogin(login: string): Promise<User | null> {
   const normalized = normalizeLogin(login);
   if (!normalized) return null;
   const data = await unwrap(
-    supabase().from('profiles').select(PROFILE_FIELDS).eq('login', normalized).limit(1),
+    supabase().from('profiles').select(PROFILE_PUBLIC_FIELDS).eq('login', normalized).limit(1),
   );
   const row = ((data ?? []) as ProfileRow[])[0];
   return row ? rowToUser(row) : null;
@@ -305,7 +331,7 @@ export async function findUserByLogin(login: string): Promise<User | null> {
 
 export async function getUserById(id: string): Promise<User | null> {
   const data = await unwrap(
-    supabase().from('profiles').select(PROFILE_FIELDS).eq('id', id).limit(1),
+    supabase().from('profiles').select(PROFILE_PUBLIC_FIELDS).eq('id', id).limit(1),
   );
   const row = ((data ?? []) as ProfileRow[])[0];
   return row ? rowToUser(row) : null;
@@ -339,7 +365,12 @@ export async function searchUsers(query: { fullName: string; group: string }): P
 
 /**
  * Вход. Пароль хэшируется на клиенте (SHA-256 от «логин:пароль»), на сервер
- * уходит только хэш — RPC verify_login ищет профиль с таким хэшем.
+ * уходит только хэш — RPC verify_login ищет профиль с таким хэшем и возвращает
+ * профиль вместе с encrypted_private_key (зашифрованным приватным ключом).
+ *
+ * Далее расшифровываем приватный ключ введённым паролем и кладём его в
+ * localStorage текущей сессии — так ключ становится переносимым: старые
+ * сообщения прочитаются с любого устройства.
  */
 export async function verifyLogin(login: string, password: string): Promise<User | null> {
   const normalized = normalizeLogin(login);
@@ -349,7 +380,45 @@ export async function verifyLogin(login: string, password: string): Promise<User
     supabase().rpc('verify_login', { p_login: normalized, p_hash: hash }),
   );
   const row = (data ?? [])[0];
-  return row ? rowToUser(row) : null;
+  if (!row) return null;
+
+  const user = rowToUser(row);
+
+  // Переносимость ключа: если в базе есть зашифрованный приватный ключ —
+  // расшифровываем его текущим паролем и кладём в localStorage.
+  if (isCryptoAvailable()) {
+    try {
+      if (row.encrypted_private_key) {
+        const privateJwk = await decryptPrivateKeyWithPassword(
+          row.encrypted_private_key,
+          `${normalized}:${password}`,
+        );
+        savePrivateKey(row.id, privateJwk);
+      } else if (!getPrivateKey(row.id)) {
+        // Старый профиль без зашифрованного ключа: генерируем пару и сохраняем
+        // зашифрованную копию в базу — со следующего входа ключ переносим.
+        const { publicKeyJwk, privateKeyJwk } = await generateUserKeys();
+        const encrypted = await encryptPrivateKeyWithPassword(
+          privateKeyJwk,
+          `${normalized}:${password}`,
+        );
+        savePrivateKey(row.id, privateKeyJwk);
+        await supabase()
+          .from('profiles')
+          .update({ encrypted_private_key: encrypted, public_key_jwk: publicKeyJwk })
+          .eq('id', row.id)
+          .then(({ error }) => {
+            if (error) console.warn('Не удалось сохранить зашифрованный ключ', error.message);
+          });
+      }
+    } catch (error) {
+      // Ключ не совпал с паролем — это отдельный сбой; продолжаем вход с
+      // публичным ключом (часть сообщений может не расшифроваться).
+      console.warn('Не удалось восстановить приватный ключ при входе', error);
+    }
+  }
+
+  return user;
 }
 
 export async function changePassword(
@@ -370,6 +439,63 @@ export async function changePassword(
     }),
   );
   if (!ok) throw new Error('Текущий пароль неверен');
+
+  // Перешифровываем приватный ключ новым паролем, если он зашифрован в базе.
+  await reencryptPrivateKeyForUser(userId, user.login, currentPassword, newPassword);
+}
+
+/**
+ * Перешифровать приватный ключ пользователя новым паролем и обновить
+ * профиль. Ключ берётся из localStorage текущей сессии либо (если его ещё нет)
+ * из зашифрованной копии в профиле.
+ */
+async function reencryptPrivateKeyForUser(
+  userId: string,
+  login: string,
+  currentPassword: string,
+  newPassword: string,
+): Promise<void> {
+  if (!isCryptoAvailable()) return;
+
+  let privateJwk = getPrivateKey(userId);
+  if (!privateJwk) {
+    // Пытаемся восстановить из базы старым паролем.
+    try {
+      const full = (await unwrap<ProfileRow[]>(
+        supabase()
+          .from('profiles')
+          .select('encrypted_private_key')
+          .eq('id', userId)
+          .limit(1),
+      )) as ProfileRow[];
+      const encrypted = (full ?? [])[0]?.encrypted_private_key;
+      if (encrypted) {
+        privateJwk = await decryptPrivateKeyWithPassword(
+          encrypted,
+          `${login}:${currentPassword}`,
+        );
+      }
+    } catch (error) {
+      console.warn('Не удалось расшифровать ключ при смене пароля', error);
+      return;
+    }
+  }
+  if (!privateJwk) return;
+
+  try {
+    const encrypted = await encryptPrivateKeyWithPassword(
+      privateJwk,
+      `${login}:${newPassword}`,
+    );
+    const { error } = await supabase()
+      .from('profiles')
+      .update({ encrypted_private_key: encrypted })
+      .eq('id', userId);
+    if (error) throw new Error(error.message);
+    savePrivateKey(userId, privateJwk);
+  } catch (error) {
+    console.warn('Не удалось перешифровать приватный ключ', error);
+  }
 }
 
 /**
@@ -647,7 +773,7 @@ export async function getUserChats(userId: string): Promise<ChatListItem[]> {
   );
   const profiles = peerIds.length
     ? ((await unwrap(
-        supabase().from('profiles').select(PROFILE_FIELDS).in('id', peerIds),
+        supabase().from('profiles').select(PROFILE_PUBLIC_FIELDS).in('id', peerIds),
       )) as ProfileRow[])
     : [];
   const byId = new Map(profiles.map((p) => [p.id, rowToUser(p)]));
@@ -725,10 +851,51 @@ export async function saveMessage(msg: Message): Promise<void> {
   announceMessage(msg);
 }
 
+const OFFLINE_QUEUE_KEY = 'svyaz.offlineQueue';
+
+/** Сообщения, ожидающие отправки при возврате сети (переживают перезагрузку) */
+export interface QueuedMessage {
+  msg: Message;
+  queuedAt: number;
+}
+
+function hasNetwork(): boolean {
+  return typeof navigator === 'undefined' ? true : navigator.onLine;
+}
+
+function readQueued(): QueuedMessage[] {
+  try {
+    const raw = window.localStorage.getItem(OFFLINE_QUEUE_KEY);
+    return raw ? (JSON.parse(raw) as QueuedMessage[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeQueued(items: QueuedMessage[]): void {
+  try {
+    window.localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(items));
+  } catch {
+    /* не критично */
+  }
+}
+
+/**
+ * Немедленно отправить сообщение в Supabase.
+ * @returns true, если запись успешна; false при отсутствии сети.
+ */
+async function insertMessageRowNow(msg: Message): Promise<boolean> {
+  if (!hasNetwork()) return false;
+  const { error } = await supabase().from('messages').insert(messageToRow(msg));
+  if (error) return false;
+  return true;
+}
+
 /**
  * Оптимистичная отправка: сразу сообщаем своему окну о новом сообщении
  * (полный объект на руках), чтобы оно мгновенно появилось в ленте, а запись
- * в Supabase происходит после. При ошибке сети вызывается rollback.
+ * в Supabase происходит после. При отсутствии сети сообщение попадает в
+ * очередь и отправится автоматически, как только сеть вернётся.
  */
 export async function saveMessageOptimistic(
   msg: Message,
@@ -743,13 +910,56 @@ export async function saveMessageOptimistic(
     senderId: msg.senderId,
     kind: 'new',
   });
+
+  // 2. Запись в базу: если сети нет — ставим в очередь.
+  let written = false;
   try {
-    // 2. Пишем в базу.
-    await insertMessageRow(msg);
+    written = await insertMessageRowNow(msg);
   } catch (error) {
     onError?.(error);
     throw error;
   }
+  if (!written) {
+    const queued: QueuedMessage[] = readQueued();
+    queued.push({ msg, queuedAt: Date.now() });
+    writeQueued(queued);
+  }
+}
+
+/** Забрать и отправить все отложенные сообщения (вызывается при online). */
+export async function flushOfflineQueue(): Promise<number> {
+  const queued = readQueued();
+  if (queued.length === 0) return 0;
+  const toSend = [...queued];
+  writeQueued([]);
+
+  let sent = 0;
+  const remaining: QueuedMessage[] = [];
+  for (const item of toSend) {
+    try {
+      // Если запись не удалась (сеть всё ещё нет) — вернём в конец очереди.
+      if (!(await insertMessageRowNow(item.msg))) {
+        remaining.push(item);
+        continue;
+      }
+      // Полная синхронизация: другие устройства и эта лента перечитают.
+      emit('message:updated', { chatId: item.msg.chatId, messageId: item.msg.id });
+      sent += 1;
+    } catch {
+      remaining.push(item);
+    }
+  }
+  if (remaining.length > 0) writeQueued([...remaining, ...readQueued()]);
+  return sent;
+}
+
+// Глобальный обработчик: при возврате сети досылаем очередь и уведомляем чат.
+if (typeof window !== 'undefined') {
+  window.addEventListener('online', () => {
+    void flushOfflineQueue().then(() => {
+      emit('chat:updated', {});
+    });
+  });
 }
 
 /** Строка сообщения без побочных эффектов (нужна медиа-сообщениям) */
@@ -1360,6 +1570,82 @@ export function setThemeMode(mode: ThemeMode): void {
 export async function getMyPublicKey(userId: string): Promise<JsonWebKey | null> {
   const user = await getUserById(userId);
   return user?.publicKeyJwk ?? null;
+}
+
+// --- админ-панель --------------------------------------------------------------
+
+/** Является ли текущий пользователь админом (используется для гварда страницы) */
+export async function isCurrentUserAdmin(userId: string | null): Promise<boolean> {
+  if (!userId) return false;
+  const user = await getUserById(userId);
+  return user?.role === 'admin';
+}
+
+/**
+ * Сбросить пароль пользователя от имени админа. Так как админ не знает старого
+ * пароля, старый зашифрованный приватный ключ становится неразбираемым —
+ * поэтому генерируем свежую пару ECDH и шифруем её новым паролем.
+ */
+export async function adminResetPassword(
+  userId: string,
+  newPassword: string,
+): Promise<void> {
+  if (newPassword.length < 6) throw new Error('Новый пароль короче 6 символов');
+  const user = await getUserById(userId);
+  if (!user) throw new Error('Пользователь не найден');
+  const newHash = await hashPassword(user.login, newPassword);
+
+  // Свежая пара ключей + зашифрованный новым паролем приватный ключ.
+  let ok = false;
+  if (isCryptoAvailable()) {
+    const { publicKeyJwk, privateKeyJwk } = await generateUserKeys();
+    const encrypted = await encryptPrivateKeyWithPassword(
+      privateKeyJwk,
+      `${user.login}:${newPassword}`,
+    );
+    const { error } = await supabase()
+      .from('profiles')
+      .update({ encrypted_private_key: encrypted, public_key_jwk: publicKeyJwk })
+      .eq('id', userId);
+    if (error) throw new Error(error.message);
+  }
+
+  const data = await unwrap<boolean>(
+    supabase().rpc('admin_reset_password', {
+      p_profile: userId,
+      p_new_hash: newHash,
+    }),
+  );
+  ok = Boolean(data);
+  if (!ok) throw new Error('Нет прав администратора или пользователь не найден');
+}
+
+/** Обновить ФИО и группу пользователя (только админ) */
+export async function adminUpdateProfile(
+  userId: string,
+  fullName: string,
+  group: string,
+): Promise<void> {
+  const ok = await unwrap<boolean>(
+    supabase().rpc('admin_update_profile', {
+      p_profile: userId,
+      p_full_name: fullName.trim(),
+      p_group: group.trim(),
+    }),
+  );
+  if (!ok) throw new Error('Нет прав администратора или пользователь не найден');
+}
+
+/** Полное удаление пользователя и всех его данных (только админ) */
+export async function adminDeleteUser(userId: string): Promise<void> {
+  const ok = await unwrap<boolean>(supabase().rpc('admin_delete_user', { p_profile: userId }));
+  if (!ok) throw new Error('Нет прав администратора или пользователь не найден');
+}
+
+/** Сбросить все сессии пользователя (только админ) */
+export async function adminLogoutUser(userId: string): Promise<void> {
+  const ok = await unwrap<boolean>(supabase().rpc('admin_logout_user', { p_profile: userId }));
+  if (!ok) throw new Error('Нет прав администратора или пользователь не найден');
 }
 
 export function hasMyPrivateKey(userId: string): boolean {
