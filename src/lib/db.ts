@@ -1453,18 +1453,30 @@ export async function getStoredMediaEnvelope(pathOrUrl: string): Promise<Envelop
   }
 }
 
-/** Расшифрованное медиа в виде Blob */
-export async function getDecryptedMediaBlob(msg: Message, userId: string): Promise<Blob | null> {
+/**
+ * Расшифрованное медиа в виде Blob. Если медиа лежит в Storage и объекта там
+ * нет, бросает ошибку с пометкой `.code === 'MEDIA_NOT_FOUND'` — интерфейс
+ * показывает «Файл недоступен» вместо бесконечной «Загрузка…».
+ */
+export async function getDecryptedMediaBlob(
+  msg: Message,
+  userId: string,
+): Promise<Blob | null> {
   // 1) Новый формат: медиа в Storage.
   if (msg.storagePath) {
     const envelope = await getStoredMediaEnvelope(msg.storagePath);
-    if (envelope) return decryptEnvelopeToBlob(msg, userId, envelope);
-    return null;
+    if (!envelope) throw new MediaNotFoundError();
+    return decryptEnvelopeToBlob(msg, userId, envelope);
   }
   // 2) Старый формат: медиа в таблице media.
   const stored = await getMedia(msg.id);
   if (!stored) return null;
   return decryptEnvelopeToBlob(msg, userId, stored);
+}
+
+/** Маркер-ошибка: зашифрованный файл не найден в Storage. */
+class MediaNotFoundError extends Error {
+  code = 'MEDIA_NOT_FOUND' as const;
 }
 
 async function decryptEnvelopeToBlob(

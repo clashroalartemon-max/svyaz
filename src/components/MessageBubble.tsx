@@ -26,16 +26,17 @@ function useDecryptedText(
   sender: User,
   myId: string,
   peerPublicKeyJwk?: JsonWebKey,
-): { text: string | null; failed: boolean } {
-  const [state, setState] = useState<{ text: string | null; failed: boolean }>({
+): { text: string | null; failed: boolean; noKey: boolean } {
+  const [state, setState] = useState<{ text: string | null; failed: boolean; noKey: boolean }>({
     text: null,
     failed: false,
+    noKey: false,
   });
 
   useEffect(() => {
     let alive = true;
     if (msg.deleted) {
-      setState({ text: null, failed: false });
+      setState({ text: null, failed: false, noKey: false });
       return;
     }
     const tryDecrypt = async (senderKey: JsonWebKey): Promise<boolean> => {
@@ -46,10 +47,26 @@ function useDecryptedText(
         peerPublicKeyJwk,
         envelope: msg,
       });
-      if (alive) setState({ text, failed: false });
+      if (alive) setState({ text, failed: false, noKey: false });
       return true;
     };
     (async () => {
+      const hasKey = Boolean(sender.publicKeyJwk && sender.publicKeyJwk.x && sender.publicKeyJwk.y);
+      // Нет ключа отправителя вовсе — сразу «Нет ключа для расшифровки».
+      if (!hasKey) {
+        // Всё же пробуем свежий ключ из БД: он мог создаться позже сообщения.
+        try {
+          const fresh = await db.getUserById(msg.senderId);
+          if (fresh && fresh.publicKeyJwk?.x && fresh.publicKeyJwk?.y) {
+            await tryDecrypt(fresh.publicKeyJwk);
+            return;
+          }
+        } catch {
+          /* не критично */
+        }
+        if (alive) setState({ text: null, failed: false, noKey: true });
+        return;
+      }
       try {
         await tryDecrypt(sender.publicKeyJwk);
       } catch {
@@ -61,7 +78,7 @@ function useDecryptedText(
           if (!fresh || !fresh.publicKeyJwk?.x) throw new Error('no key');
           await tryDecrypt(fresh.publicKeyJwk);
         } catch {
-          if (alive) setState({ text: null, failed: true });
+          if (alive) setState({ text: null, failed: true, noKey: false });
         }
       }
     })();
@@ -88,16 +105,20 @@ function useDecryptedMedia(
   sender: User,
   myId: string,
   peerPublicKeyJwk?: JsonWebKey,
-): { url: string | null; failed: boolean } {
-  const [state, setState] = useState<{ url: string | null; failed: boolean }>({
+): { url: string | null; failed: boolean; notFound: boolean } {
+  const [state, setState] = useState<{ url: string | null; failed: boolean; notFound: boolean }>({
     url: null,
     failed: false,
+    notFound: false,
   });
 
   useEffect(() => {
     let alive = true;
     let url: string | null = null;
-    if (msg.deleted) return;
+    if (msg.deleted) {
+      setState({ url: null, failed: false, notFound: false });
+      return;
+    }
     const tryDecrypt = async (senderKey: JsonWebKey): Promise<Blob> => {
       const stored = await db.getMedia(msg.id);
       if (!stored) throw new Error('media not found');
@@ -119,25 +140,35 @@ function useDecryptedMedia(
     };
     (async () => {
       // Приоритет: Storage (новые медиа), затем таблица media (старые сообщения).
-      const blob = (await tryDecryptBlob()) ?? null;
-      if (blob) {
-        url = URL.createObjectURL(blob);
-        if (alive) setState({ url, failed: false });
+      if (msg.storagePath) {
+        try {
+          const blob = await tryDecryptBlob();
+          if (blob) {
+            url = URL.createObjectURL(blob);
+            if (alive) setState({ url, failed: false, notFound: false });
+            return;
+          }
+          // Медиа не расшифровалось (нет ключа) — не вечная загрузка.
+          if (alive) setState({ url: null, failed: true, notFound: false });
+        } catch (e) {
+          const isNotFound = (e as { code?: string })?.code === 'MEDIA_NOT_FOUND';
+          if (alive) setState({ url: null, failed: true, notFound: isNotFound });
+        }
         return;
       }
       try {
         const b = await tryDecrypt(sender.publicKeyJwk);
         url = URL.createObjectURL(b);
-        if (alive) setState({ url, failed: false });
+        if (alive) setState({ url, failed: false, notFound: false });
       } catch {
         try {
           const fresh = await db.getUserById(msg.senderId);
           if (!fresh || !fresh.publicKeyJwk?.x) throw new Error('no key');
           const b = await tryDecrypt(fresh.publicKeyJwk);
           url = URL.createObjectURL(b);
-          if (alive) setState({ url, failed: false });
+          if (alive) setState({ url, failed: false, notFound: false });
         } catch {
-          if (alive) setState({ url: null, failed: true });
+          if (alive) setState({ url: null, failed: true, notFound: false });
         }
       }
     })();
@@ -624,7 +655,8 @@ function TextContent({
   peerPublicKeyJwk?: JsonWebKey;
   highlight: string;
 }) {
-  const { text, failed } = useDecryptedText(msg, sender, myId, peerPublicKeyJwk);
+  const { text, failed, noKey } = useDecryptedText(msg, sender, myId, peerPublicKeyJwk);
+  if (noKey) return <span className="text-text-muted">Нет ключа для расшифровки</span>;
   if (failed) return <FailedNotice />;
   return (
     <span className="whitespace-pre-wrap break-words">
@@ -644,8 +676,14 @@ function MediaContent({
   myId: string;
   peerPublicKeyJwk?: JsonWebKey;
 }) {
-  const { url, failed } = useDecryptedMedia(msg, sender, myId, peerPublicKeyJwk);
-  if (failed) return <FailedNotice />;
+  const { url, failed, notFound } = useDecryptedMedia(msg, sender, myId, peerPublicKeyJwk);
+  if (failed) {
+    return notFound ? (
+      <span className="text-text-muted">Файл недоступен</span>
+    ) : (
+      <FailedNotice />
+    );
+  }
   if (!url) return <span className="text-text-muted">Загрузка…</span>;
 
   switch (msg.type) {

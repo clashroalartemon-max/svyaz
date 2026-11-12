@@ -770,12 +770,12 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
   return (
     <div className="flex h-full min-w-0 flex-col bg-bg">
       {/* шапка */}
-      <header className="flex shrink-0 items-center gap-3 border-b border-border px-3 py-2.5 sm:px-4">
+      <header className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-2 sm:gap-2 sm:px-3">
         {(showBack || !isDesktop) && (
           <button
             type="button"
             onClick={() => navigate('/main')}
-            className="rounded-lg p-1.5 text-text-muted hover:bg-surface hover:text-text"
+            className="shrink-0 rounded-lg p-1.5 text-text-muted hover:bg-surface hover:text-text"
             aria-label="Назад"
           >
             <ArrowLeft size={20} />
@@ -785,7 +785,7 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
         <button
           type="button"
           onClick={() => navigate(`/profile/${chatId}`)}
-          className="flex min-w-0 flex-1 items-center gap-3 text-left"
+          className="flex min-w-0 flex-1 items-center gap-2 rounded-lg pr-1 text-left hover:bg-surface/60"
           aria-label="Открыть профиль"
         >
           <div className="relative shrink-0">
@@ -803,23 +803,15 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
               />
             )}
           </div>
-        </button>
-
-        <div className="min-w-0 flex-1">
-          <button
-            type="button"
-            onClick={() => navigate(`/profile/${chatId}`)}
-            className="block max-w-full text-left"
-            aria-label="Открыть профиль"
-          >
+          <div className="min-w-0 flex-1">
             <div className="truncate text-[15px] font-medium text-text">{title}</div>
             <div
               className={`truncate text-[13px] ${peerTyping ? 'text-accent' : 'text-text-muted'}`}
             >
               {subtitle}
             </div>
-          </button>
-        </div>
+          </div>
+        </button>
 
         <button
           type="button"
@@ -827,7 +819,7 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
             setSearchOpen((v) => !v);
             setSearchQuery('');
           }}
-          className={`rounded-lg p-2 hover:bg-surface hover:text-text ${
+          className={`shrink-0 rounded-lg p-2 hover:bg-surface hover:text-text ${
             searchOpen ? 'text-accent' : 'text-text-muted'
           }`}
           aria-label="Поиск в чате"
@@ -837,7 +829,7 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
         <button
           type="button"
           onClick={() => setSettingsOpen(true)}
-          className="rounded-lg p-2 text-text-muted hover:bg-surface hover:text-text"
+          className="shrink-0 rounded-lg p-2 text-text-muted hover:bg-surface hover:text-text"
           aria-label="Настройки чата"
         >
           <MoreVertical size={18} />
