@@ -14,6 +14,7 @@ import {
   Upload,
 } from 'lucide-react';
 import * as db from '../lib/db';
+import { emit } from '../lib/bus';
 import { getCryptoBackend } from '../lib/crypto';
 import type { KeyPairStatus } from '../lib/crypto';
 import { useCurrentUser, useTheme } from '../hooks';
@@ -60,6 +61,11 @@ export function SettingsPage() {
   const [avatarBusy, setAvatarBusy] = useState(false);
   const [avatarNotice, setAvatarNotice] = useState<string | null>(null);
 
+  const [username, setUsername] = useState('');
+  const [usernameBusy, setUsernameBusy] = useState(false);
+  const [usernameError, setUsernameError] = useState<string | null>(null);
+  const [usernameNotice, setUsernameNotice] = useState<string | null>(null);
+
   const myId = me?.id ?? null;
 
   useEffect(() => {
@@ -98,6 +104,24 @@ export function SettingsPage() {
       setAvatarNotice(err instanceof Error ? err.message : 'Не удалось загрузить аватарку');
     } finally {
       setAvatarBusy(false);
+    }
+  };
+
+  const saveUsername = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!myId) return;
+    setUsernameBusy(true);
+    setUsernameError(null);
+    setUsernameNotice(null);
+    try {
+      await db.setMyUsername(username);
+      setUsernameNotice('Ник сохранён');
+      // Профиль перечитывается хуком useCurrentUser при событии auth/avatar.
+      emit('avatar:updated', { userId: myId });
+    } catch (err) {
+      setUsernameError(err instanceof Error ? err.message : 'Не удалось сохранить ник');
+    } finally {
+      setUsernameBusy(false);
     }
   };
 
@@ -223,8 +247,29 @@ export function SettingsPage() {
           <div className="text-[17px] font-medium text-text">{me.fullName}</div>
           <div className="text-[13px] text-text-muted">
             {me.group} · @{me.login}
+            {me.username && <span> · ник @{me.username}</span>}
           </div>
         </div>
+
+        <Section
+          title="Ник (username)"
+          hint="Уникальный ник для поиска по точному совпадению. Можно менять в любой момент."
+        >
+          <form onSubmit={(e) => void saveUsername(e)} className="flex flex-col gap-3">
+            <Input
+              label="Ник"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder="например, smirnov_152"
+              autoComplete="off"
+            />
+            {usernameError && <p className="text-[13px] text-danger">{usernameError}</p>}
+            {usernameNotice && <p className="text-[13px] text-text-muted">{usernameNotice}</p>}
+            <Button type="submit" disabled={usernameBusy} className="w-full">
+              {usernameBusy ? 'Сохранение…' : 'Сохранить ник'}
+            </Button>
+          </form>
+        </Section>
 
         <Section title="Тема оформления" hint="Как в системе — автоматически за ОС">
           <div className="grid grid-cols-3 gap-2">

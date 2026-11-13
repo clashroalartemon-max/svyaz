@@ -1,17 +1,24 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import {
+  ArchiveRestore,
   Camera,
+  Check,
   CircleDot,
   CornerUpLeft,
   Download,
   Pencil,
+  Search,
   Square,
   Star,
   Trash2,
+  UserPlus,
   X,
 } from 'lucide-react';
 import type { Message } from '../types';
+import * as db from '../lib/db';
+import type { User } from '../types';
+import { Avatar } from '../ui';
 
 /** Общая рамка модального окна */
 export function ModalOverlay({
@@ -266,10 +273,15 @@ export function CircleCaptureModal({
     return `0:${String(s).padStart(2, '0')}`;
   };
 
+  const ringR = 114;
+  const ringLength = 2 * Math.PI * ringR;
+  const elapsedPct = Math.min(1, elapsed / MAX_CIRCLE_SECONDS);
+
   return (
     <ModalOverlay onClose={phase === 'recording' ? null : onClose}>
       <div className="flex flex-col items-center gap-3">
-        <div className="relative h-[240px] w-[240px] overflow-hidden rounded-full bg-black">
+        <div className="relative h-[240px] w-[240px]">
+        <div className="absolute inset-0 overflow-hidden rounded-full bg-black">
           {phase !== 'preview' ? (
             <video
               ref={liveRef}
@@ -288,10 +300,39 @@ export function CircleCaptureModal({
             />
           )}
           {phase === 'recording' && (
-            <span className="absolute left-1/2 top-3 -translate-x-1/2 rounded-full bg-danger/90 px-2 py-0.5 text-[13px] tabular-nums text-white">
-              {fmt(elapsed)} / {fmt(MAX_CIRCLE_SECONDS)}
-            </span>
+            <>
+              <span className="absolute left-1/2 top-3 -translate-x-1/2 rounded-full bg-danger/90 px-2.5 py-0.5 text-[13px] tabular-nums text-white">
+                {fmt(elapsed)}
+              </span>
+              <span className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                <span className="rounded-full bg-black/35 px-3 py-1 text-[15px] font-medium tabular-nums text-white">
+                  {fmt(MAX_CIRCLE_SECONDS - elapsed)}
+                </span>
+              </span>
+            </>
           )}
+        </div>
+
+        {/* кольцо прогресса записи вокруг кружка */}
+        <svg
+          viewBox="0 0 240 240"
+          className="pointer-events-none absolute inset-0 -rotate-90"
+          aria-hidden="true"
+        >
+          <circle cx="120" cy="120" r={ringR} fill="none" stroke="rgba(255,255,255,0.18)" strokeWidth="5" />
+          <circle
+            cx="120"
+            cy="120"
+            r={ringR}
+            fill="none"
+            stroke="currentColor"
+            className={phase === 'recording' ? 'text-danger' : 'text-accent'}
+            strokeWidth="5"
+            strokeLinecap="round"
+            strokeDasharray={ringLength}
+            strokeDashoffset={ringLength * (phase === 'recording' ? 1 - elapsedPct : 0)}
+          />
+        </svg>
         </div>
 
         {failed && <p className="text-text-muted">Нет доступа к камере</p>}
@@ -440,17 +481,25 @@ export function ChatSettingsModal({
   title,
   secret,
   busy,
+  archived = false,
+  canAddMembers = false,
+  onAddMembers,
   onToggleSecret,
   onExport,
   onClear,
+  onUnarchive,
   onClose,
 }: {
   title: string;
   secret: boolean;
   busy: boolean;
+  archived?: boolean;
+  canAddMembers?: boolean;
+  onAddMembers?: () => void;
   onToggleSecret: () => void;
   onExport: () => void;
   onClear: () => void;
+  onUnarchive: (() => void) | null;
   onClose: () => void;
 }) {
   return (
@@ -488,6 +537,28 @@ export function ChatSettingsModal({
         </button>
 
         <div className="space-y-2">
+          {canAddMembers && onAddMembers && (
+            <button
+              type="button"
+              onClick={onAddMembers}
+              disabled={busy}
+              className="flex w-full items-center gap-2.5 rounded-lg border border-border px-3 py-2.5 text-left text-[15px] text-text hover:bg-surface disabled:opacity-50"
+            >
+              <UserPlus size={16} className="text-text-muted" />
+              Добавить участника
+            </button>
+          )}
+          {archived && onUnarchive && (
+            <button
+              type="button"
+              onClick={onUnarchive}
+              disabled={busy}
+              className="flex w-full items-center gap-2.5 rounded-lg border border-border px-3 py-2.5 text-left text-[15px] text-text hover:bg-surface disabled:opacity-50"
+            >
+              <ArchiveRestore size={16} className="text-text-muted" />
+              Разархивировать чат
+            </button>
+          )}
           <button
             type="button"
             onClick={onExport}
@@ -511,6 +582,194 @@ export function ChatSettingsModal({
         <p className="text-[13px] text-text-muted">
           История удаляется без возможности восстановления. Ключи шифрования не затрагиваются.
         </p>
+      </div>
+    </ModalOverlay>
+  );
+}
+
+// --- добавление участников ---------------------------------------------------------
+
+/**
+ * Добавление людей в существующий чат. Доступно владельцу чата и командному
+ * составу (role_level > 1) для чатов взвода/курса/преподавателей.
+ * Поиск идёт по всем пользователям, а не только по контактам.
+ */
+export function AddParticipantModal({
+  chatId,
+  existingIds,
+  onAdded,
+  onClose,
+}: {
+  chatId: string;
+  existingIds: string[];
+  onAdded: (count: number) => void;
+  onClose: () => void;
+}) {
+  const [users, setUsers] = useState<User[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [query, setQuery] = useState('');
+  const [group, setGroup] = useState('');
+  const [selected, setSelected] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    db.getAllUsers()
+      .then((list) => {
+        if (alive) setUsers(list);
+      })
+      .catch(() => {
+        if (alive) setError('Не удалось загрузить список пользователей');
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const existing = useMemo(() => new Set(existingIds), [existingIds]);
+  const groups = useMemo(
+    () =>
+      Array.from(new Set(users.map((u) => u.group).filter(Boolean))).sort((a, b) =>
+        a.localeCompare(b, 'ru'),
+      ),
+    [users],
+  );
+
+  const q = query.trim().toLowerCase();
+  const filtered = users.filter((u) => {
+    if (existing.has(u.id)) return false;
+    if (group && u.group !== group) return false;
+    if (!q) return true;
+    return (
+      u.fullName.toLowerCase().includes(q) ||
+      (u.position ?? '').toLowerCase().includes(q) ||
+      (u.group ?? '').toLowerCase().includes(q)
+    );
+  });
+
+  const toggle = (id: string) => {
+    setSelected((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+    );
+  };
+
+  const add = async () => {
+    if (selected.length === 0 || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const count = await db.addChatParticipants(chatId, selected);
+      onAdded(count);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Не удалось добавить участников');
+      setBusy(false);
+    }
+  };
+
+  return (
+    <ModalOverlay onClose={busy ? null : onClose} wide>
+      <div className="flex max-h-[80vh] flex-col gap-3">
+        <div>
+          <h2 className="text-[17px] font-medium text-text">Добавить участника</h2>
+          <p className="text-[13px] text-text-muted">
+            Поиск по всем пользователям: ФИО, взвод или должность
+          </p>
+        </div>
+
+        <div className="relative">
+          <Search
+            size={16}
+            className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-text-muted"
+          />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Найти человека"
+            className="w-full rounded-lg border border-border bg-surface py-2 pl-9 pr-3 text-[15px] text-text placeholder:text-text-muted focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+          />
+        </div>
+
+        <select
+          value={group}
+          onChange={(e) => setGroup(e.target.value)}
+          className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-[14px] text-text"
+        >
+          <option value="">Все взводы и подразделения</option>
+          {groups.map((g) => (
+            <option key={g} value={g}>
+              {g}
+            </option>
+          ))}
+        </select>
+
+        <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border">
+          {loading ? (
+            <div className="p-4 text-[13px] text-text-muted">Загрузка…</div>
+          ) : filtered.length === 0 ? (
+            <div className="p-4 text-[13px] text-text-muted">
+              {users.length === 0 ? 'Пользователи не найдены' : 'Ничего не найдено'}
+            </div>
+          ) : (
+            filtered.map((u) => {
+              const active = selected.includes(u.id);
+              return (
+                <button
+                  key={u.id}
+                  type="button"
+                  onClick={() => toggle(u.id)}
+                  className={`flex w-full items-center gap-3 border-b border-border px-3 py-2.5 text-left last:border-b-0 ${
+                    active ? 'bg-accent/10' : 'hover:bg-surface'
+                  }`}
+                  aria-pressed={active}
+                >
+                  <span
+                    className={`flex h-5 w-5 shrink-0 items-center justify-center rounded border ${
+                      active ? 'border-accent bg-accent text-white' : 'border-border'
+                    }`}
+                  >
+                    {active && <Check size={13} />}
+                  </span>
+                  <Avatar name={u.fullName} size="sm" seed={u.id} src={u.avatarUrl} />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-[14px] text-text">{u.fullName}</span>
+                    <span className="block truncate text-[12px] text-text-muted">
+                      {[u.position, u.rank, u.group].filter(Boolean).join(' · ')}
+                    </span>
+                  </span>
+                </button>
+              );
+            })
+          )}
+        </div>
+
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-[12px] text-text-muted">Выбрано: {selected.length}</span>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={busy}
+              className="rounded-lg px-3 py-2 text-text hover:bg-surface disabled:opacity-50"
+            >
+              Отмена
+            </button>
+            <button
+              type="button"
+              onClick={() => void add()}
+              disabled={busy || selected.length === 0}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-2 text-[14px] font-medium text-white hover:opacity-85 disabled:opacity-50"
+            >
+              <UserPlus size={16} />
+              {busy ? 'Добавляем…' : 'Добавить'}
+            </button>
+          </div>
+        </div>
+
+        {error && <p className="text-[13px] text-danger">{error}</p>}
       </div>
     </ModalOverlay>
   );

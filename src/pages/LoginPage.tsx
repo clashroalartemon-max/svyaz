@@ -30,6 +30,8 @@ export function LoginPage() {
       }
       db.setCurrentUserId(user.id);
       void db.registerSession(user.id);
+      // Автоматические чаты взвода/командира/курсового/преподавателей (Ч.3)
+      void db.ensureAutoChats(user.id);
       // редирект произойдёт через useAuth
     } catch (err) {
       setError(

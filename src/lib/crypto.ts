@@ -419,6 +419,56 @@ export interface EncryptParams {
   data: string | ArrayBuffer;
 }
 
+/** Групповой вариант: ключ контента заворачивается для каждого участника */
+export interface EncryptGroupParams {
+  myId: string;
+  myPublicKeyJwk: JsonWebKey;
+  /** публичные ключи всех участников чата (включая себя) */
+  members: Array<{ id: string; publicKeyJwk: JsonWebKey }>;
+  data: string | ArrayBuffer;
+}
+
+/**
+ * Зашифровать данные для группы. Контент шифруется одним случайным ключом,
+ * который заворачивается ECDH-секретом для каждого участника — приходит
+ * в groupKeys. Свою копию ключа кладём в groupKeys[myId].
+ */
+export async function encryptForGroup(params: EncryptGroupParams): Promise<EnvelopeFields & {
+  groupKeys: Record<string, { w: string; i: string }>;
+}> {
+  const { myId, members, data } = params;
+  if (!isCryptoAvailable()) {
+    throw new Error('Шифрование недоступно: браузер не даёт доступа к генератору случайных чисел');
+  }
+  const myPrivateJwk = getPrivateKey(myId);
+  if (!myPrivateJwk) throw new Error('Приватный ключ пользователя не найден в этом браузере');
+
+  const contentKey = randomBytes(CONTENT_KEY_BYTES);
+  const iv = randomBytes(IV_BYTES);
+  const plaintext =
+    typeof data === 'string' ? textEncoder.encode(data) : new Uint8Array(data);
+  const ciphertext = await aesEncryptBytes(contentKey, iv, plaintext);
+
+  const groupKeys: Record<string, { w: string; i: string }> = {};
+  const seen = new Set<string>();
+  for (const m of members) {
+    if (!m.publicKeyJwk || !m.publicKeyJwk.x || !m.publicKeyJwk.y || seen.has(m.id)) continue;
+    seen.add(m.id);
+    const wrapping = await deriveAesKeyBytes(myPrivateJwk, m.publicKeyJwk);
+    const { wrapped, iv: wrappedIv } = await wrapKeyBytes(wrapping, contentKey);
+    groupKeys[m.id] = { w: wrapped, i: wrappedIv };
+  }
+  if (Object.keys(groupKeys).length === 0) {
+    throw new Error('Нет участников с ключами для группового шифрования');
+  }
+
+  return {
+    ciphertext: toBase64(ciphertext),
+    iv: toBase64(iv),
+    groupKeys,
+  };
+}
+
 /**
  * Зашифровать данные для получателя. Возвращает конверт: зашифрованный контент
  * плюс ключ контента, завёрнутый для получателя и для автора.
@@ -475,6 +525,29 @@ export interface DecryptParams {
   envelope: EnvelopeFields;
 }
 
+/**
+ * Расшифровать групповое сообщение: ключ контента берётся из groupKeys[myId],
+ * завёрнутый ECDH(приватный автора, мой публичный) — разворачивается
+ * ECDH(мой приватный, публичный автора). Автор и получатели читают одинаково.
+ */
+export async function decryptGroupEnvelope(params: {
+  myId: string;
+  senderPublicKeyJwk: JsonWebKey;
+  groupKeys: Record<string, { w: string; i: string }> | undefined;
+  envelope: EnvelopeFields;
+}): Promise<Uint8Array<ArrayBuffer>> {
+  const { myId, senderPublicKeyJwk, groupKeys, envelope } = params;
+  if (!isCryptoAvailable()) throw new Error('Шифрование недоступно в этом браузере');
+  const myPrivateJwk = getPrivateKey(myId);
+  if (!myPrivateJwk) throw new Error('Приватный ключ пользователя не найден в этом браузере');
+  const mine = groupKeys?.[myId];
+  if (!mine || !mine.w || !mine.i) throw new Error('Нет ключа для этого участника');
+
+  const wrappingKey = await deriveAesKeyBytes(myPrivateJwk, senderPublicKeyJwk);
+  const contentKey = await unwrapKeyBytes(wrappingKey, mine.w, mine.i);
+  return aesDecryptBytes(contentKey, fromBase64(envelope.iv), fromBase64(envelope.ciphertext));
+}
+
 async function decryptWithWrappingKey(
   wrappingKey: Uint8Array<ArrayBuffer>,
   envelope: EnvelopeFields,
@@ -506,6 +579,19 @@ export async function decryptEnvelope(params: DecryptParams): Promise<Uint8Array
   if (!myPrivateJwk) throw new Error('Приватный ключ пользователя не найден в этом браузере');
   if (!envelope.ciphertext || !envelope.iv) {
     throw new Error('Сообщение не содержит шифротекста');
+  }
+
+  // Групповое сообщение: ключ контента лежит в groupKeys — заворачивается
+  // и разворачивается иначе, чем в личном конверте. Пробуем сначала его.
+  const groupKeys = (envelope as EnvelopeFields & { groupKeys?: Record<string, { w: string; i: string }> })
+    .groupKeys;
+  if (groupKeys && groupKeys[myId]) {
+    return decryptGroupEnvelope({
+      myId,
+      senderPublicKeyJwk,
+      groupKeys,
+      envelope,
+    });
   }
 
   const attempts: Array<() => Promise<Uint8Array<ArrayBuffer>>> = [];

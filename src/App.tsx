@@ -11,9 +11,11 @@ import { LoginPage } from './pages/LoginPage';
 import { MainPage } from './pages/MainPage';
 import { SearchPage } from './pages/SearchPage';
 import { SettingsPage } from './pages/SettingsPage';
+import { ContactsPage } from './pages/ContactsPage';
 import { ChatPage } from './pages/ChatPage';
 import { AdminPage } from './pages/AdminPage';
 import { ProfilePage } from './pages/ProfilePage';
+import { StructurePage } from './pages/StructurePage';
 
 function RequireAuth({ children }: { children: ReactNode }) {
   const userId = useAuth();
@@ -272,6 +274,14 @@ export function App() {
             {/* старый адрес поиска — оставлен для совместимости со ссылками */}
             <Route path="/friends" element={<Navigate to="/search" replace />} />
             <Route
+              path="/contacts"
+              element={
+                <RequireAuth>
+                  <ContactsPage />
+                </RequireAuth>
+              }
+            />
+            <Route
               path="/settings"
               element={
                 <RequireAuth>
@@ -292,6 +302,14 @@ export function App() {
               element={
                 <RequireAuth>
                   <ProfilePage />
+                </RequireAuth>
+              }
+            />
+            <Route
+              path="/structure"
+              element={
+                <RequireAuth>
+                  <StructurePage />
                 </RequireAuth>
               }
             />

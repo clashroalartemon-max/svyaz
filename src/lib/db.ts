@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Слой данных «Связи» поверх Supabase.
  *
  * Раньше всё лежало в localStorage — из-за этого два устройства жили в двух
@@ -12,11 +12,14 @@
 import * as storage from './storage';
 import { supabase, setSupabaseUser } from './supabase';
 import { emit } from './bus';
+import { autoAssignRankForGroup } from './ranks';
 import { broadcastChat, broadcastMessage, sendTyping } from './realtime';
 import {
   decryptEnvelope,
   decryptEnvelopeToString,
+  decryptGroupEnvelope,
   decryptPrivateKeyWithPassword,
+  derivePublicKeyJwk,
   encryptFor,
   encryptPrivateKeyWithPassword,
   generateUserKeys,
@@ -28,7 +31,9 @@ import {
 } from './crypto';
 import type { KeyPairStatus } from './crypto';
 import type {
+  Broadcast,
   Chat,
+  ChatKind,
   ChatListItem,
   EnvelopeFields,
   Message,
@@ -120,9 +125,15 @@ interface ProfileRow {
   full_name: string;
   group_name: string;
   role: Role;
+  military_rank: string | null;
+  position: string | null;
+  role_level: number | null;
+  username: string | null;
   public_key_jwk: JsonWebKey | null;
   encrypted_private_key: string | null;
   avatar_url: string | null;
+  department: string | null;
+  phone: string | null;
   created_at: number | string;
 }
 
@@ -138,6 +149,12 @@ function rowToUser(row: ProfileRow): User {
     fullName: row.full_name,
     group: row.group_name,
     role: row.role,
+    rank: row.military_rank ?? undefined,
+    position: row.position ?? undefined,
+    roleLevel: row.role_level ?? 1,
+    username: row.username ?? undefined,
+    department: row.department ?? undefined,
+    phone: row.phone ?? undefined,
     publicKeyJwk: row.public_key_jwk ?? {},
     avatarUrl: row.avatar_url ?? undefined,
     createdAt: Number(row.created_at ?? 0),
@@ -145,7 +162,7 @@ function rowToUser(row: ProfileRow): User {
 }
 
 const PROFILE_FIELDS =
-  'id,login,full_name,group_name,role,public_key_jwk,encrypted_private_key,avatar_url,created_at';
+  'id,login,full_name,group_name,role,military_rank,position,role_level,username,public_key_jwk,encrypted_private_key,avatar_url,department,phone,created_at';
 
 /**
  * SELECT-поля для логина без приватного ключа собеседников: encrypted_private_key
@@ -154,7 +171,50 @@ const PROFILE_FIELDS =
  * другим пользователям (поиск, список чатов).
  */
 const PROFILE_PUBLIC_FIELDS =
-  'id,login,full_name,group_name,role,public_key_jwk,avatar_url,created_at';
+  'id,login,full_name,group_name,role,military_rank,position,role_level,username,public_key_jwk,avatar_url,department,phone,created_at';
+
+// Резервный набор полей: живая база может быть ещё без новых колонок
+// (department/phone). Тогда приложение продолжает работать, а новые
+// возможности включаются после применения schema.sql.
+const PROFILE_BASE_FIELDS =
+  'id,login,full_name,group_name,role,military_rank,position,role_level,username,public_key_jwk,encrypted_private_key,avatar_url,created_at';
+const PROFILE_BASE_PUBLIC_FIELDS =
+  'id,login,full_name,group_name,role,military_rank,position,role_level,username,public_key_jwk,avatar_url,created_at';
+
+/** Поддерживает ли живая база новые колонки профиля (department, phone). */
+let profileExtrasSupported: boolean | null = null;
+
+async function ensureProfileExtras(): Promise<boolean> {
+  if (profileExtrasSupported !== null) return profileExtrasSupported;
+  try {
+    const { error } = await supabase().from('profiles').select('department,phone').limit(1);
+    profileExtrasSupported = !error;
+  } catch {
+    profileExtrasSupported = false;
+  }
+  return profileExtrasSupported;
+}
+
+/** Убрать из строки профиля новые колонки, если их нет в базе. */
+function profileRowForWrite(row: Record<string, unknown>): Record<string, unknown> {
+  if (profileExtrasSupported === false) {
+    const copy = { ...row };
+    delete copy.department;
+    delete copy.phone;
+    return copy;
+  }
+  return row;
+}
+
+/** Поля публичного профиля с учётом фактической схемы базы. */
+async function publicProfileFields(): Promise<string> {
+  return (await ensureProfileExtras()) ? PROFILE_PUBLIC_FIELDS : PROFILE_BASE_PUBLIC_FIELDS;
+}
+
+/** Поля полного профиля (с приватным ключом) с учётом схемы базы. */
+async function fullProfileFields(): Promise<string> {
+  return (await ensureProfileExtras()) ? PROFILE_FIELDS : PROFILE_BASE_FIELDS;
+}
 
 export interface NewUserInput {
   login: string;
@@ -189,9 +249,15 @@ async function prepareProfile(input: NewUserInput): Promise<PreparedProfile> {
       full_name: input.fullName.trim(),
       group_name: input.group.trim(),
       role: input.role,
+      military_rank: null,
+      position: null,
+      role_level: input.role === 'admin' ? 10 : 1,
+      username: null,
       public_key_jwk: publicKeyJwk,
       encrypted_private_key: encryptedPrivateKey,
       avatar_url: null,
+      department: null,
+      phone: null,
       created_at: Date.now(),
     },
     passwordHash: await hashPassword(login, input.password),
@@ -203,8 +269,13 @@ async function prepareProfile(input: NewUserInput): Promise<PreparedProfile> {
 
 export async function createUser(input: NewUserInput): Promise<User> {
   const { profile, passwordHash } = await prepareProfile(input);
+  await ensureProfileExtras();
   const data = await unwrap<ProfileRow>(
-    supabase().from('profiles').insert(profile).select(PROFILE_FIELDS).single(),
+    supabase()
+      .from('profiles')
+      .insert(profileRowForWrite(profile as unknown as Record<string, unknown>))
+      .select(await fullProfileFields())
+      .single(),
   );
   const { error } = await supabase()
     .from('credentials')
@@ -238,10 +309,14 @@ export async function createUsersBatch(
   if (rows.length === 0) return [];
 
   const inserted: ProfileRow[] = [];
+  await ensureProfileExtras();
+  const fullFields = await fullProfileFields();
   for (let i = 0; i < rows.length; i += 100) {
-    const chunk = rows.slice(i, i + 100).map((r) => r.profile);
+    const chunk = rows
+      .slice(i, i + 100)
+      .map((r) => profileRowForWrite(r.profile as unknown as Record<string, unknown>));
     const data = await unwrap<ProfileRow[]>(
-      supabase().from('profiles').insert(chunk).select(PROFILE_FIELDS),
+      supabase().from('profiles').insert(chunk).select(fullFields),
     );
     inserted.push(...(data ?? []));
   }
@@ -298,7 +373,7 @@ export async function getAllUsers(): Promise<User[]> {
     const rows = (await unwrap(
       supabase()
         .from('profiles')
-        .select(PROFILE_PUBLIC_FIELDS)
+        .select(await publicProfileFields())
         .order('created_at', { ascending: true })
         .order('id', { ascending: true })
         .range(from, from + PROFILES_PAGE_SIZE - 1),
@@ -323,7 +398,7 @@ export async function findUserByLogin(login: string): Promise<User | null> {
   const normalized = normalizeLogin(login);
   if (!normalized) return null;
   const data = await unwrap(
-    supabase().from('profiles').select(PROFILE_PUBLIC_FIELDS).eq('login', normalized).limit(1),
+    supabase().from('profiles').select(await publicProfileFields()).eq('login', normalized).limit(1),
   );
   const row = ((data ?? []) as ProfileRow[])[0];
   return row ? rowToUser(row) : null;
@@ -331,10 +406,44 @@ export async function findUserByLogin(login: string): Promise<User | null> {
 
 export async function getUserById(id: string): Promise<User | null> {
   const data = await unwrap(
-    supabase().from('profiles').select(PROFILE_PUBLIC_FIELDS).eq('id', id).limit(1),
+    supabase().from('profiles').select(await publicProfileFields()).eq('id', id).limit(1),
   );
   const row = ((data ?? []) as ProfileRow[])[0];
   return row ? rowToUser(row) : null;
+}
+
+export interface DepartmentRow {
+  id: string;
+  name: string;
+  kind: string;
+}
+
+export interface PositionRow {
+  id: string;
+  name: string;
+  departmentId: string | null;
+  roleLevel: number;
+}
+
+/** Все подразделения структуры университета (отсортированы по важности). */
+export async function getDepartments(): Promise<DepartmentRow[]> {
+  const rows = (await unwrap(
+    supabase().from('departments').select('id,name,kind').order('sort_order', { ascending: true }),
+  )) as { id: string; name: string; kind: string }[];
+  return (rows ?? []).map((r) => ({ id: r.id, name: r.name, kind: r.kind }));
+}
+
+/** Все должности структуры (имя + подразделение + уровень прав). */
+export async function getPositions(): Promise<PositionRow[]> {
+  const rows = (await unwrap(
+    supabase().from('positions').select('id,name,department_id,role_level').order('role_level', { ascending: false }),
+  )) as { id: string; name: string; department_id: string | null; role_level: number }[];
+  return (rows ?? []).map((r) => ({
+    id: r.id,
+    name: r.name,
+    departmentId: r.department_id,
+    roleLevel: r.role_level,
+  }));
 }
 
 /**
@@ -361,6 +470,20 @@ export async function searchUsers(query: { fullName: string; group: string }): P
     const userDigits = (userGroup.match(/\d+/) ?? [''])[0];
     return groupDigits !== '' && userDigits === groupDigits;
   });
+}
+
+/**
+ * Поиск по точному совпадению ника (username). Возвращает null, если ник
+ * не найден — интерфейс показывает сообщение «Ник не найден».
+ */
+export async function searchUserByUsername(username: string): Promise<User | null> {
+  const normalized = normalizeLogin(username);
+  if (!normalized) return null;
+  const data = await unwrap(
+    supabase().from('profiles').select(await publicProfileFields()).eq('username', normalized).limit(1),
+  );
+  const row = ((data ?? []) as ProfileRow[])[0];
+  return row ? rowToUser(row) : null;
 }
 
 /**
@@ -543,6 +666,23 @@ export async function ensureUserKeyPair(userId: string): Promise<User | null> {
   }
   if (status === 'ok') return user;
 
+  // Если локально уже есть приватный ключ, НИКОГДА не пересоздаём его:
+  // пересоздание делает нечитаемыми все сообщения, зашифрованные этим
+  // ключом (включая свежие групповые). Вместо этого приводим публичный ключ
+  // в БД в соответствие с существующим приватным.
+  const privateJwk = getPrivateKey(userId);
+  if (privateJwk) {
+    const publicKeyJwk = (await derivePublicKeyJwk(privateJwk)) ?? user.publicKeyJwk;
+    if (!publicKeyJwk || !publicKeyJwk.x || !publicKeyJwk.y) return user;
+    const { error } = await supabase()
+      .from('profiles')
+      .update({ public_key_jwk: publicKeyJwk })
+      .eq('id', userId);
+    if (error) throw new Error(error.message);
+    emit('keys:updated', { userId });
+    return { ...user, publicKeyJwk };
+  }
+
   const { publicKeyJwk, privateKeyJwk } = await generateUserKeys();
   savePrivateKey(userId, privateKeyJwk);
   const { error } = await supabase()
@@ -581,20 +721,26 @@ interface ChatRow {
   saved: boolean;
   owner_id: string | null;
   secret?: boolean | null;
+  kind?: string | null;
+  title?: string | null;
+  target?: string | null;
 }
 
 function rowToChat(row: ChatRow, participants: string[]): Chat {
-  const pair: [string, string] = [participants[0], participants[1] ?? participants[0]];
   return {
     id: row.id,
-    participants: pair,
+    participants,
     createdAt: Number(row.created_at ?? 0),
+    ownerId: row.owner_id ?? undefined,
     saved: row.saved === true,
     secret: row.secret === true,
+    kind: (row.kind as ChatKind | undefined) ?? undefined,
+    title: row.title ?? undefined,
+    target: row.target ?? undefined,
   };
 }
 
-const CHAT_FIELDS = 'id,created_at,saved,owner_id,secret';
+const CHAT_FIELDS = 'id,created_at,saved,owner_id,secret,kind,title,target';
 
 async function loadChat(chatId: string): Promise<Chat | null> {
   const data = (await unwrap(
@@ -687,6 +833,71 @@ export async function getOrCreateChat(a: string, b: string): Promise<Chat> {
   return rowToChat(row, [a, b]);
 }
 
+/**
+ * Создать групповой чат. Участники — владелец и выбранные пользователи.
+ * Пустой список допустим: чат можно наполнить позже из настроек.
+ */
+export async function createGroupChat(
+  ownerId: string,
+  title: string,
+  memberIds: string[],
+): Promise<Chat> {
+  const members = Array.from(new Set(memberIds.filter((id) => id && id !== ownerId)));
+  const chatId = uid();
+  const cleanTitle = title.trim() || 'Групповой чат';
+  const row: ChatRow = {
+    id: chatId,
+    created_at: Date.now(),
+    saved: false,
+    owner_id: ownerId,
+    secret: false,
+    kind: 'group',
+    title: cleanTitle,
+    target: null,
+  };
+
+  const { error: chatError } = await supabase().from('chats').insert(row);
+  if (chatError) throw new Error(chatError.message);
+
+  const all = [ownerId, ...members];
+  const { error: partsError } = await supabase()
+    .from('chat_participants')
+    .insert(all.map((id) => ({ chat_id: chatId, user_id: id })));
+  if (partsError) throw new Error(partsError.message);
+
+  emit('chat:updated', { chatId });
+  void broadcastChat(chatId);
+  return rowToChat(row, all);
+}
+
+/**
+ * Добавить участников в существующий чат. Повторные добавления игнорируются.
+ * Возвращает число реально добавленных людей.
+ */
+export async function addChatParticipants(
+  chatId: string,
+  userIds: string[],
+): Promise<number> {
+  const wanted = Array.from(new Set(userIds.filter(Boolean)));
+  if (wanted.length === 0) return 0;
+
+  const existing = (await unwrap(
+    supabase().from('chat_participants').select('user_id').eq('chat_id', chatId),
+  )) as { user_id: string }[];
+  const have = new Set((existing ?? []).map((r) => r.user_id));
+  const toAdd = wanted.filter((id) => !have.has(id));
+  if (toAdd.length === 0) return 0;
+
+  const { error } = await supabase()
+    .from('chat_participants')
+    .insert(toAdd.map((id) => ({ chat_id: chatId, user_id: id })));
+  if (error) throw new Error(error.message);
+
+  emit('chat:updated', { chatId });
+  void broadcastChat(chatId);
+  return toAdd.length;
+}
+
 /** Включить/выключить секретный чат (сообщения автоудаляются через 24 ч) */
 export async function setChatSecret(chatId: string, secret: boolean): Promise<void> {
   const { error } = await supabase().from('chats').update({ secret }).eq('id', chatId);
@@ -719,6 +930,257 @@ export async function getChatById(id: string): Promise<Chat | null> {
   return loadChat(id);
 }
 
+/**
+ * Автоматические чаты взвода (Ч.3): вызывается при входе/старте. Серверная
+ * функция ensure_auto_chats создаёт недостающие чаты (взвод, командир, курсовой,
+ * преподаватели) и возвращает их id. После этого список чатов перечитывается.
+ */
+export async function ensureAutoChats(userId: string): Promise<string[]> {
+  try {
+    const data = await unwrap<string[]>(supabase().rpc('ensure_auto_chats', { p_user: userId }));
+    const ids = (data ?? []).filter(Boolean);
+    if (ids.length > 0) {
+      emit('chat:updated', {});
+      void broadcastChat(ids[0]);
+    }
+    return ids;
+  } catch (e) {
+    console.warn('ensureAutoChats failed', e);
+    return [];
+  }
+}
+
+/**
+ * Создать общий чат с выбранным взводом (Ч.3.3). Разрешено пользователям
+ * с role_level > 1. Возвращает id чата (нового или уже существующего).
+ */
+export async function createSquadGroupChat(userId: string, squad: string): Promise<string | null> {
+  try {
+    const data = await unwrap<string>(supabase().rpc('create_squad_group_chat', {
+      p_creator: userId,
+      p_squad: squad.trim(),
+    }));
+    const id = data ?? null;
+    if (id) {
+      emit('chat:updated', {});
+      void broadcastChat(id);
+    }
+    return id;
+  } catch (e) {
+    console.warn('createSquadGroupChat failed', e);
+    return null;
+  }
+}
+
+/** Список взводов (групп) в системе — для выбора целевого взвода */
+export async function getSquadList(): Promise<string[]> {
+  const users = await getAllUsers();
+  const squads = new Set<string>();
+  for (const u of users) {
+    const g = u.group.trim();
+    if (!g) continue;
+    squads.add(g.endsWith('взвод') ? g : `${g} взвод`);
+  }
+  return Array.from(squads).sort((a, b) => a.localeCompare(b, 'ru'));
+}
+
+/** Создать оповещение (рассылка). НЕ создаёт чат — сохраняет запись в broadcasts
+ *  и адресует получателям. Доступно пользователям с role_level > 1.
+ *  Для custom получатели передаются в targetUserIds (выбор из контактов). */
+export async function sendBroadcast(
+  userId: string,
+  targetType: 'squad' | 'course' | 'faculty' | 'university' | 'custom',
+  targetValue: string,
+  title: string,
+  targetUserIds?: string[],
+): Promise<string | null> {
+  try {
+    const data = await unwrap<string>(
+      supabase().rpc('send_broadcast', {
+        p_sender: userId,
+        p_target_type: targetType,
+        p_target_value: targetValue,
+        p_text: title,
+        p_target_user_ids: targetUserIds ?? [],
+      }),
+    );
+    const id = data ?? null;
+    if (id) emit('broadcast:new', {});
+    return id;
+  } catch (e) {
+    console.warn('sendBroadcast failed', e);
+    return null;
+  }
+}
+
+/** Список оповещений, адресованных пользователю (отправителю или получателю). */
+export async function getMyBroadcasts(userId: string): Promise<Broadcast[]> {
+  const fields = 'id,sender_id,target_type,target_value,text,target_user_ids,created_at';
+  type Row = {
+    id: string;
+    sender_id: string;
+    target_type: string;
+    target_value: string | null;
+    text: string;
+    target_user_ids: string[] | null;
+    created_at: number | string;
+  };
+
+  const collected = new Map<string, Row>();
+
+  // 1. Свои оповещения.
+  try {
+    const sent = (await unwrap(
+      supabase()
+        .from('broadcasts')
+        .select(fields)
+        .eq('sender_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(200),
+    )) as Row[];
+    for (const row of sent ?? []) collected.set(row.id, row);
+  } catch {
+    /* покажем хотя бы полученные */
+  }
+
+  // 2. Полученные: сначала id из леджера получателей, затем сами оповещения.
+  // Подзапрос внутри or() PostgREST не поддерживает — он парсит его как uuid.
+  try {
+    const recipients = (await unwrap(
+      supabase().from('broadcast_recipients').select('broadcast_id').eq('user_id', userId),
+    )) as { broadcast_id: string }[];
+    const ids = Array.from(new Set((recipients ?? []).map((r) => r.broadcast_id)));
+    for (let i = 0; i < ids.length; i += 100) {
+      const chunk = ids.slice(i, i + 100);
+      const rows = (await unwrap(
+        supabase()
+          .from('broadcasts')
+          .select(fields)
+          .in('id', chunk)
+          .order('created_at', { ascending: false })
+          .limit(200),
+      )) as Row[];
+      for (const row of rows ?? []) collected.set(row.id, row);
+    }
+  } catch {
+    /* оповещения придут при следующем открытии */
+  }
+
+  return Array.from(collected.values())
+    .sort((a, b) => Number(b.created_at ?? 0) - Number(a.created_at ?? 0))
+    .slice(0, 200)
+    .map((r) => ({
+      id: r.id,
+      senderId: r.sender_id,
+      targetType: r.target_type as Broadcast['targetType'],
+      targetValue: r.target_value ?? undefined,
+      text: r.text,
+      targetUserIds: r.target_user_ids ?? undefined,
+      createdAt: Number(r.created_at ?? 0),
+    }));
+}
+
+// --- архив чатов -----------------------------------------------------------------
+
+/** CHAT_ARCHIVE_IDS — заархивированные id чатов текущего пользователя */
+export async function getArchivedChatIds(userId: string): Promise<string[]> {
+  const rows = (await unwrap(
+    supabase().from('chat_archive').select('chat_id').eq('user_id', userId),
+  )) as { chat_id: string }[];
+  return (rows ?? []).map((r) => r.chat_id);
+}
+
+/** Заархивировать чат (скрыть из основного списка, оставить доступным) */
+export async function archiveChat(userId: string, chatId: string): Promise<void> {
+  const { error } = await supabase()
+    .from('chat_archive')
+    .upsert({ user_id: userId, chat_id: chatId, archived_at: Date.now() }, { onConflict: 'user_id,chat_id' });
+  if (error) throw new Error(error.message);
+  emit('chat:updated', { chatId });
+}
+
+/** Разархивировать чат */
+export async function unarchiveChat(userId: string, chatId: string): Promise<void> {
+  const { error } = await supabase()
+    .from('chat_archive')
+    .delete()
+    .eq('user_id', userId)
+    .eq('chat_id', chatId);
+  if (error) throw new Error(error.message);
+  emit('chat:updated', { chatId });
+}
+
+// --- контакты -------------------------------------------------------------------
+
+export interface ContactEntry {
+  userId: string;
+  folder: string;
+  user: User;
+  addedAt: number;
+}
+
+/** Все контакты пользователя: профили людей + папка */
+export async function getContacts(userId: string): Promise<ContactEntry[]> {
+  const rows = (await unwrap(
+    supabase().from('contacts').select('user_id,folder,created_at').eq('owner_id', userId),
+  )) as { user_id: string; folder: string; created_at: number | string }[];
+  if (!rows || rows.length === 0) return [];
+
+  const profiles = (await unwrap(
+    supabase().from('profiles').select(await publicProfileFields()).in('id', rows.map((r) => r.user_id)),
+  )) as ProfileRow[];
+  const byId = new Map(profiles.map((p) => [p.id, rowToUser(p)]));
+
+  return rows
+    .map((r) => {
+      const u = byId.get(r.user_id);
+      return u
+        ? { userId: r.user_id, folder: r.folder || 'Общие', user: u, addedAt: Number(r.created_at ?? 0) }
+        : null;
+    })
+    .filter((x): x is ContactEntry => x !== null)
+    .sort((a, b) => a.user.fullName.localeCompare(b.user.fullName, 'ru'));
+}
+
+/** Добавить пользователя в контакты (в папку «Общие») */
+export async function addContact(ownerId: string, userId: string): Promise<void> {
+  const { error } = await supabase()
+    .from('contacts')
+    .upsert({ owner_id: ownerId, user_id: userId, folder: 'Общие', created_at: Date.now() }, { onConflict: 'owner_id,user_id' });
+  if (error) throw new Error(error.message);
+  emit('chat:updated', {});
+}
+
+/** Убрать из контактов */
+export async function removeContact(ownerId: string, userId: string): Promise<void> {
+  const { error } = await supabase()
+    .from('contacts')
+    .delete()
+    .eq('owner_id', ownerId)
+    .eq('user_id', userId);
+  if (error) throw new Error(error.message);
+  emit('chat:updated', {});
+}
+
+/** Перенести контакт в другую папку (drag-and-drop) */
+export async function moveContactToFolder(ownerId: string, userId: string, folder: string): Promise<void> {
+  const { error } = await supabase()
+    .from('contacts')
+    .update({ folder })
+    .eq('owner_id', ownerId)
+    .eq('user_id', userId);
+  if (error) throw new Error(error.message);
+  emit('chat:updated', {});
+}
+
+/** Все id пользователей, которых пользователь добавил в контакты */
+export async function getContactIds(ownerId: string): Promise<Set<string>> {
+  const rows = (await unwrap(
+    supabase().from('contacts').select('user_id').eq('owner_id', ownerId),
+  )) as { user_id: string }[];
+  return new Set((rows ?? []).map((r) => r.user_id));
+}
+
 interface MessageRow {
   id: string;
   chat_id: string;
@@ -739,13 +1201,14 @@ interface MessageRow {
   deleted: boolean | null;
   deleted_for: string[] | null;
   storage_path: string | null;
+  group_keys: Record<string, { w: string; i: string }> | null;
   created_at: number | string;
 }
 
 const MESSAGE_FIELDS =
   'id,chat_id,sender_id,ciphertext,iv,wrapped_key,wrapped_key_iv,wrapped_self_key,' +
   'wrapped_self_key_iv,reply_to_id,type,mime_type,duration,waveform,status,edited_at,deleted,' +
-  'deleted_for,storage_path,created_at';
+  'deleted_for,storage_path,group_keys,created_at';
 
 function rowToMessage(row: MessageRow): Message {
   return {
@@ -768,6 +1231,7 @@ function rowToMessage(row: MessageRow): Message {
     deleted: row.deleted === true,
     deletedFor: row.deleted_for ?? undefined,
     storagePath: row.storage_path ?? undefined,
+    groupKeys: row.group_keys ?? undefined,
     createdAt: Number(row.created_at ?? 0),
   };
 }
@@ -802,7 +1266,7 @@ export async function getUserChats(userId: string): Promise<ChatListItem[]> {
   );
   const profiles = peerIds.length
     ? ((await unwrap(
-        supabase().from('profiles').select(PROFILE_PUBLIC_FIELDS).in('id', peerIds),
+        supabase().from('profiles').select(await publicProfileFields()).in('id', peerIds),
       )) as ProfileRow[])
     : [];
   const byId = new Map(profiles.map((p) => [p.id, rowToUser(p)]));
@@ -827,8 +1291,28 @@ export async function getUserChats(userId: string): Promise<ChatListItem[]> {
       .filter((p) => p.chat_id === row.id)
       .map((p) => p.user_id);
     const chat = rowToChat(row, chatParts);
-    const peerId = chatParts.find((id) => id !== userId) ?? userId;
-    const peer = byId.get(peerId);
+    // Групповой — только чат, где реально несколько участников, либо
+    // очевидно групповые kind (squad/teachers/group/broadcast). Личные
+    // авточаты «С командиром взвода» (commander) и «С курсовым» (course)
+    // имеют ровно двух участников и должны показывать имя собеседника.
+    const groupedKind = row.kind === 'squad' || row.kind === 'teachers' || row.kind === 'group' || row.kind === 'broadcast';
+    const isGroup = groupedKind || chatParts.length > 2;
+    let peer: User | undefined;
+    if (isGroup) {
+      // Групповой чат: «собеседник» — заголовок/взвод, чтобы список чатов имел имя.
+      peer = {
+        id: row.id,
+        login: '',
+        fullName: row.title ?? 'Групповой чат',
+        group: row.target ?? '',
+        role: 'cadet',
+        publicKeyJwk: {},
+        createdAt: 0,
+      };
+    } else {
+      const peerId = chatParts.find((id) => id !== userId) ?? userId;
+      peer = byId.get(peerId);
+    }
     if (!peer) continue;
 
     const chatMessages = (messages ?? []).filter((m) => m.chat_id === row.id);
@@ -846,12 +1330,51 @@ export async function getUserChats(userId: string): Promise<ChatListItem[]> {
     });
   }
 
-  list.sort((a, b) => {
+  // Дедупликация: авточаты (взвод, командир, курс, преподаватели) могли
+  // завестись дважды с разными id и даже без target. Ключ — тип + номер:
+  // «152 взвод» и target «152» дают один ключ. Из дублей оставляем чат,
+  // где больше участников, затем — с более свежим сообщением.
+  const autoIndex = new Map<string, number>();
+  const deduped: typeof list = [];
+  for (const item of list) {
+    const kind = item.chat.kind ?? '';
+    const isAuto =
+      kind === 'squad' ||
+      kind === 'commander' ||
+      kind === 'course' ||
+      kind === 'teachers' ||
+      kind === 'group';
+    if (!isAuto) {
+      deduped.push(item);
+      continue;
+    }
+    const raw = item.chat.target || item.chat.title || '';
+    const digits = (raw.match(/\d+/) ?? [''])[0];
+    // «group» и «squad» — один и тот же чат взвода: сводим к общему ключу.
+    const keyKind = kind === 'group' ? 'squad' : kind;
+    const autoKey = `${keyKind}:${digits}`;
+    const existing = autoIndex.get(autoKey);
+    if (existing === undefined) {
+      autoIndex.set(autoKey, deduped.length);
+      deduped.push(item);
+      continue;
+    }
+    const kept = deduped[existing];
+    const keptMembers = kept.chat.participants?.length ?? 0;
+    const nextMembers = item.chat.participants?.length ?? 0;
+    const keptFresh = kept.lastMessage?.createdAt ?? 0;
+    const nextFresh = item.lastMessage?.createdAt ?? 0;
+    if (nextMembers > keptMembers || (nextMembers === keptMembers && nextFresh > keptFresh)) {
+      deduped[existing] = item;
+    }
+  }
+
+  deduped.sort((a, b) => {
     const at = a.lastMessage?.createdAt ?? a.chat.createdAt;
     const bt = b.lastMessage?.createdAt ?? b.chat.createdAt;
     return bt - at;
   });
-  return list;
+  return deduped;
 }
 
 // --- сообщения ----------------------------------------------------------------
@@ -940,13 +1463,14 @@ export async function saveMessageOptimistic(
     kind: 'new',
   });
 
-  // 2. Запись в базу: если сети нет — ставим в очередь.
+  // 2. Запись в базу: если сети нет или запрос сорвался — ставим в очередь,
+  // сообщение не теряется и уйдёт автоматически при возврате сети.
   let written = false;
   try {
     written = await insertMessageRowNow(msg);
   } catch (error) {
     onError?.(error);
-    throw error;
+    written = false;
   }
   if (!written) {
     const queued: QueuedMessage[] = readQueued();
@@ -1006,6 +1530,7 @@ function messageToRow(msg: Message): Record<string, unknown> {
     status: msg.status ?? 'sent',
     deleted_for: msg.deletedFor ?? [],
     storage_path: msg.storagePath ?? null,
+    group_keys: msg.groupKeys ?? null,
     created_at: msg.createdAt,
     ...envelopeToRow(msg),
   };
@@ -1039,6 +1564,7 @@ export async function updateMessage(
   if (patch.wrappedKeyIv !== undefined) row.wrapped_key_iv = patch.wrappedKeyIv;
   if (patch.wrappedSelfKey !== undefined) row.wrapped_self_key = patch.wrappedSelfKey;
   if (patch.wrappedSelfKeyIv !== undefined) row.wrapped_self_key_iv = patch.wrappedSelfKeyIv;
+  if (patch.groupKeys !== undefined) row.group_keys = patch.groupKeys;
   if (patch.status !== undefined) row.status = patch.status;
   if (patch.editedAt !== undefined) row.edited_at = patch.editedAt;
   if (patch.deleted !== undefined) row.deleted = patch.deleted;
@@ -1211,6 +1737,8 @@ export interface MediaMessageMeta {
   mimeType: string;
   duration?: number;
   waveform?: number[];
+  /** групповое шифрование: ключ контента для каждого участника */
+  groupKeys?: Record<string, { w: string; i: string }>;
   createdAt: number;
 }
 
@@ -1237,26 +1765,41 @@ export async function saveMediaMessage(
     mimeType: meta.mimeType,
     duration: meta.duration,
     waveform: meta.waveform,
+    groupKeys: meta.groupKeys,
     status: 'sent',
     createdAt: meta.createdAt,
     ciphertext: '',
     iv: '',
   };
+  // 1. Сначала строка сообщения: политики RLS на Storage и таблицу media
+  // разрешают запись только участнику существующего сообщения.
+  await insertMessageRow(msg);
+
+  let stored = false;
   try {
     // Новые медиа всегда идут в Storage; в messages кладём только ссылку.
     const storagePath = await uploadStoredMedia(meta.id, envelope);
+    const { error } = await supabase()
+      .from('messages')
+      .update({ storage_path: storagePath })
+      .eq('id', meta.id);
+    if (error) throw new Error(error.message);
     msg.storagePath = storagePath;
+    stored = true;
   } catch {
     // Если Storage недоступен (bucket не создан) — фолбэк на старую схему
     // хранения в таблице media, чтобы отправка не падала целиком.
     try {
       await saveMedia(meta.id, { ...envelope, mimeType: meta.mimeType });
+      stored = true;
     } catch (error) {
+      // Не оставляем в ленте сообщение без медиа: убираем строку и сообщаем.
+      await supabase().from('messages').delete().eq('id', meta.id);
       throw error;
     }
   }
-  await insertMessageRow(msg);
-  announceMessage(msg);
+
+  if (stored) announceMessage(msg);
 }
 
 /** Публичный ключ собеседника в чате (для чтения своих сообщений старого формата) */
@@ -1414,8 +1957,9 @@ export async function uploadStoredMedia(msgId: string, envelope: EnvelopeFields)
     contentType: 'application/octet-stream',
   });
   if (error) throw new Error(error.message);
-  const { data } = supabase().storage.from(MEDIA_BUCKET).getPublicUrl(path);
-  return data.publicUrl;
+  // Храним именно путь: бакет приватный, публичный URL не откроется,
+  // а download() по пути работает для участников чата.
+  return path;
 }
 
 /** Получить URL объекта в Storage по его public URL (для скачивания). */
@@ -1442,7 +1986,10 @@ export async function deleteStoredMedia(pathOrUrl: string): Promise<void> {
  */
 export async function getStoredMediaEnvelope(pathOrUrl: string): Promise<EnvelopeFields | null> {
   try {
-    const { data, error } = await supabase().storage.from(MEDIA_BUCKET).download(pathOrUrl);
+    const path = pathOrUrl.includes('/object/public/')
+      ? (storageObjectPathFromUrl(pathOrUrl) ?? pathOrUrl)
+      : pathOrUrl;
+    const { data, error } = await supabase().storage.from(MEDIA_BUCKET).download(path);
     if (error || !data) return null;
     const text = await data.text();
     const parsed = JSON.parse(text) as EnvelopeFields & { v?: number };
@@ -1518,6 +2065,21 @@ export async function readMessageText(msg: Message, userId: string): Promise<str
       envelope: msg,
     });
   };
+  // Групповое сообщение: расшифровываем через groupKeys[userId]
+  if (msg.groupKeys) {
+    try {
+      const bytes = await decryptGroupEnvelope({
+        myId: userId,
+        senderPublicKeyJwk: sender.publicKeyJwk,
+        groupKeys: msg.groupKeys,
+        envelope: msg,
+      });
+      return new TextDecoder().decode(bytes);
+    } catch (err) {
+      console.warn('readMessageText group decrypt failed', err);
+      return null;
+    }
+  }
   try {
     return await attempt(sender.publicKeyJwk);
   } catch {
@@ -1753,20 +2315,34 @@ export async function adminResetPassword(
   if (!ok) throw new Error('Нет прав администратора или пользователь не найден');
 }
 
-/** Обновить ФИО и группу пользователя (только админ) */
+/** Обновить ФИО, группу, звание, должность и уровень прав (только админ) */
 export async function adminUpdateProfile(
   userId: string,
   fullName: string,
   group: string,
+  rank: string,
+  position: string,
+  roleLevel: number,
+  department?: string,
 ): Promise<void> {
   const ok = await unwrap<boolean>(
     supabase().rpc('admin_update_profile', {
       p_profile: userId,
       p_full_name: fullName.trim(),
       p_group: group.trim(),
+      p_rank: rank.trim(),
+      p_position: position.trim(),
+      p_role_level: roleLevel,
+      p_department: department?.trim() ?? '',
     }),
   );
   if (!ok) throw new Error('Нет прав администратора или пользователь не найден');
+}
+
+/** Установить уникальный ник текущего пользователя (очистка — пустой строкой) */
+export async function setMyUsername(username: string): Promise<void> {
+  const ok = await unwrap<boolean>(supabase().rpc('set_username', { p_username: username.trim() }));
+  if (!ok) throw new Error('Этот ник уже занят');
 }
 
 /** Полное удаление пользователя и всех его данных (только админ) */
@@ -1838,3 +2414,501 @@ export async function encryptForSelf(
     data,
   });
 }
+
+// =====================================================================
+// Админ-панель: журнал действий, статистика, чаты, оповещения,
+// структура и настройки системы.
+// =====================================================================
+
+export interface AuditEntry {
+  id: string;
+  actorId: string | null;
+  actorName: string | null;
+  action: string;
+  targetType: string | null;
+  targetId: string | null;
+  details: string | null;
+  createdAt: number;
+}
+
+/** Записать событие в журнал действий (не роняет вызывающий код при ошибке). */
+export async function logAudit(
+  actorId: string | null,
+  action: string,
+  targetType?: string | null,
+  targetId?: string | null,
+  details?: string | null,
+): Promise<void> {
+  if (!actorId) return;
+  try {
+    await supabase().rpc('log_audit', {
+      p_actor: actorId,
+      p_action: action,
+      p_target_type: targetType ?? null,
+      p_target_id: targetId ?? null,
+      p_details: details ?? null,
+    });
+  } catch (e) {
+    console.warn('logAudit failed', e);
+  }
+}
+
+/** Журнал действий с фильтрами (админ). */
+export async function getAuditLog(filters: {
+  actor?: string;
+  action?: string;
+  from?: number;
+  to?: number;
+  limit?: number;
+}): Promise<AuditEntry[]> {
+  let query = supabase()
+    .from('audit_log')
+    .select('id,actor_id,actor_name,action,target_type,target_id,details,created_at')
+    .order('created_at', { ascending: false })
+    .limit(filters.limit ?? 300);
+  if (filters.actor?.trim()) query = query.ilike('actor_name', `%${filters.actor.trim()}%`);
+  if (filters.action?.trim()) query = query.ilike('action', `%${filters.action.trim()}%`);
+  if (filters.from) query = query.gte('created_at', filters.from);
+  if (filters.to) query = query.lte('created_at', filters.to);
+  const rows = (await unwrap(query)) as Array<{
+    id: string;
+    actor_id: string | null;
+    actor_name: string | null;
+    action: string;
+    target_type: string | null;
+    target_id: string | null;
+    details: string | null;
+    created_at: number | string;
+  }>;
+  return (rows ?? []).map((r) => ({
+    id: r.id,
+    actorId: r.actor_id,
+    actorName: r.actor_name,
+    action: r.action,
+    targetType: r.target_type,
+    targetId: r.target_id,
+    details: r.details,
+    createdAt: Number(r.created_at ?? 0),
+  }));
+}
+
+export interface AdminStats {
+  usersTotal: number;
+  usersOnline: number;
+  usersOffline: number;
+  messagesToday: number;
+  messagesWeek: number;
+  activeChats: number;
+  /** 7 дней: { label, count } — для мини-графика */
+  activity: Array<{ label: string; count: number }>;
+}
+
+/** Статистика для дашборда админ-панели. */
+export async function getAdminStats(): Promise<AdminStats> {
+  const now = Date.now();
+  const startToday = new Date();
+  startToday.setHours(0, 0, 0, 0);
+  const todayMs = startToday.getTime();
+  const weekMs = now - 7 * 24 * 60 * 60 * 1000;
+
+  const users = (await unwrap(supabase().from('profiles').select('id'))) as { id: string }[];
+  const presence = (await unwrap(
+    supabase().from('presence').select('user_id,last_seen'),
+  )) as { user_id: string; last_seen: number | string }[];
+
+  const onlineThreshold = now - 5 * 60 * 1000; // 5 минут — считаем онлайн
+  const onlineIds = new Set(
+    (presence ?? [])
+      .filter((p) => Number(p.last_seen ?? 0) > onlineThreshold)
+      .map((p) => p.user_id),
+  );
+
+  const msgsToday = (await unwrap(
+    supabase().from('messages').select('id').gte('created_at', todayMs),
+  )) as { id: string }[];
+  const msgsWeek = (await unwrap(
+    supabase().from('messages').select('id').gte('created_at', weekMs),
+  )) as { id: string }[];
+
+  const weekChats = (await unwrap(
+    supabase().from('messages').select('chat_id').gte('created_at', weekMs),
+  )) as { chat_id: string }[];
+  const activeChats = new Set((weekChats ?? []).map((m) => m.chat_id)).size;
+
+  // Активность по дням за 7 дней.
+  const weekMessages = (await unwrap(
+    supabase().from('messages').select('created_at').gte('created_at', weekMs),
+  )) as { created_at: number | string }[];
+  const activity: Array<{ label: string; count: number }> = [];
+  for (let i = 6; i >= 0; i -= 1) {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    d.setDate(d.getDate() - i);
+    const from = d.getTime();
+    const to = from + 24 * 60 * 60 * 1000;
+    const count = (weekMessages ?? []).filter((m) => {
+      const t = Number(m.created_at ?? 0);
+      return t >= from && t < to;
+    }).length;
+    activity.push({
+      label: d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' }),
+      count,
+    });
+  }
+
+  const total = (users ?? []).length;
+  return {
+    usersTotal: total,
+    usersOnline: onlineIds.size,
+    usersOffline: Math.max(0, total - onlineIds.size),
+    messagesToday: (msgsToday ?? []).length,
+    messagesWeek: (msgsWeek ?? []).length,
+    activeChats,
+    activity,
+  };
+}
+
+export interface AdminChatRow {
+  id: string;
+  kind: string;
+  title: string | null;
+  target: string | null;
+  createdAt: number;
+  pinned: boolean;
+  participants: string[];
+  messageCount: number;
+}
+
+/** Все чаты системы (админ): участники, число сообщений, закрепление. */
+export async function adminGetChats(): Promise<AdminChatRow[]> {
+  // Основной путь — security definer RPC: RLS обычного select показал бы
+  // администратору только чаты, где он сам участник.
+  try {
+    const rows = (await unwrap(
+      supabase().rpc('admin_list_chats', { p_limit: 500 }),
+    )) as Array<{
+      id: string;
+      created_at: number | string;
+      kind: string | null;
+      title: string | null;
+      target: string | null;
+      pinned: boolean | null;
+      participants: string[] | null;
+      message_count: number | null;
+    }>;
+    if (rows && rows.length > 0) {
+      return rows.map((c) => ({
+        id: c.id,
+        kind: c.kind ?? 'direct',
+        title: c.title,
+        target: c.target,
+        createdAt: Number(c.created_at ?? 0),
+        pinned: Boolean(c.pinned),
+        participants: c.participants ?? [],
+        messageCount: Number(c.message_count ?? 0),
+      }));
+    }
+  } catch {
+    /* функция ещё не создана в живой базе — уходим на прямой запрос */
+  }
+
+  const hasPinned = await ensureChatsPinned();
+  let q = supabase()
+    .from('chats')
+    .select(hasPinned ? 'id,created_at,kind,title,target,pinned' : 'id,created_at,kind,title,target')
+    .order('created_at', { ascending: false })
+    .limit(500);
+  const chats = (await unwrap(q)) as Array<{
+    id: string;
+    created_at: number | string;
+    kind: string | null;
+    title: string | null;
+    target: string | null;
+    pinned?: boolean | null;
+  }>;
+  const ids = (chats ?? []).map((c) => c.id);
+  if (ids.length === 0) return [];
+
+  const parts = (await unwrap(
+    supabase().from('chat_participants').select('chat_id,user_id').in('chat_id', ids),
+  )) as { chat_id: string; user_id: string }[];
+  const msgs = (await unwrap(
+    supabase().from('messages').select('chat_id').in('chat_id', ids),
+  )) as { chat_id: string }[];
+
+  const partsByChat = new Map<string, string[]>();
+  for (const p of parts ?? []) {
+    const arr = partsByChat.get(p.chat_id) ?? [];
+    arr.push(p.user_id);
+    partsByChat.set(p.chat_id, arr);
+  }
+  const countByChat = new Map<string, number>();
+  for (const m of msgs ?? []) {
+    countByChat.set(m.chat_id, (countByChat.get(m.chat_id) ?? 0) + 1);
+  }
+
+  return (chats ?? []).map((c) => ({
+    id: c.id,
+    kind: c.kind ?? 'direct',
+    title: c.title,
+    target: c.target,
+    createdAt: Number(c.created_at ?? 0),
+    pinned: Boolean(c.pinned),
+    participants: partsByChat.get(c.id) ?? [],
+    messageCount: countByChat.get(c.id) ?? 0,
+  }));
+}
+
+/** Есть ли в живой базе колонка chats.pinned. */
+let chatsPinnedSupported: boolean | null = null;
+async function ensureChatsPinned(): Promise<boolean> {
+  if (chatsPinnedSupported !== null) return chatsPinnedSupported;
+  try {
+    const { error } = await supabase().from('chats').select('pinned').limit(1);
+    chatsPinnedSupported = !error;
+  } catch {
+    chatsPinnedSupported = false;
+  }
+  return chatsPinnedSupported;
+}
+
+/** Удалить чат со всеми сообщениями (для всех участников). */
+export async function adminDeleteChat(chatId: string): Promise<void> {
+  const { error } = await supabase().from('chats').delete().eq('id', chatId);
+  if (error) throw new Error(error.message);
+  emit('chat:updated', { chatId });
+}
+
+/** Закрепить / открепить чат. */
+export async function adminToggleChatPin(chatId: string, pinned: boolean): Promise<void> {
+  const { error } = await supabase().from('chats').update({ pinned }).eq('id', chatId);
+  if (error) throw new Error(error.message);
+  emit('chat:updated', { chatId });
+}
+
+export interface AdminBroadcastRow {
+  id: string;
+  senderId: string;
+  senderName: string;
+  targetType: string;
+  targetValue: string | null;
+  text: string;
+  createdAt: number;
+  recipients: number;
+  readCount: number;
+}
+
+/** Все оповещения системы с числом получателей и прочтений (админ). */
+export async function adminGetBroadcasts(): Promise<AdminBroadcastRow[]> {
+  const rows = (await unwrap(
+    supabase()
+      .from('broadcasts')
+      .select('id,sender_id,target_type,target_value,text,created_at')
+      .order('created_at', { ascending: false })
+      .limit(300),
+  )) as Array<{
+    id: string;
+    sender_id: string;
+    target_type: string;
+    target_value: string | null;
+    text: string;
+    created_at: number | string;
+  }>;
+  if (!rows || rows.length === 0) return [];
+
+  const ids = rows.map((r) => r.id);
+  const recipients = (await unwrap(
+    supabase().from('broadcast_recipients').select('broadcast_id,read_at').in('broadcast_id', ids),
+  )) as { broadcast_id: string; read_at: number | string | null }[];
+
+  const totalByB = new Map<string, number>();
+  const readByB = new Map<string, number>();
+  for (const r of recipients ?? []) {
+    totalByB.set(r.broadcast_id, (totalByB.get(r.broadcast_id) ?? 0) + 1);
+    if (r.read_at) readByB.set(r.broadcast_id, (readByB.get(r.broadcast_id) ?? 0) + 1);
+  }
+
+  const senderIds = Array.from(new Set(rows.map((r) => r.sender_id)));
+  const profiles = (await unwrap(
+    supabase().from('profiles').select('id,full_name').in('id', senderIds),
+  )) as { id: string; full_name: string }[];
+  const nameById = new Map((profiles ?? []).map((p) => [p.id, p.full_name]));
+
+  return rows.map((r) => ({
+    id: r.id,
+    senderId: r.sender_id,
+    senderName: nameById.get(r.sender_id) ?? '—',
+    targetType: r.target_type,
+    targetValue: r.target_value,
+    text: r.text,
+    createdAt: Number(r.created_at ?? 0),
+    recipients: totalByB.get(r.id) ?? 0,
+    readCount: readByB.get(r.id) ?? 0,
+  }));
+}
+
+/** Удалить оповещение у всех получателей. */
+export async function adminDeleteBroadcast(id: string): Promise<void> {
+  const { error } = await supabase().from('broadcasts').delete().eq('id', id);
+  if (error) throw new Error(error.message);
+  emit('broadcast:new', {});
+}
+
+/** Изменить текст оповещения (если ещё не прочитано получателями). */
+export async function adminUpdateBroadcastText(id: string, text: string): Promise<void> {
+  const { error } = await supabase()
+    .from('broadcasts')
+    .update({ text: text.trim() })
+    .eq('id', id);
+  if (error) throw new Error(error.message);
+  emit('broadcast:new', {});
+}
+
+export interface AppSettings {
+  registrationEnabled: boolean;
+  chatsDisabled: boolean;
+  mainAdminId: string;
+}
+
+/** Настройки системы. */
+export async function getAppSettings(): Promise<AppSettings> {
+  const rows = (await unwrap(
+    supabase().from('app_settings').select('key,value'),
+  )) as { key: string; value: string }[];
+  const map = new Map((rows ?? []).map((r) => [r.key, r.value]));
+  return {
+    registrationEnabled: map.get('registration_enabled') === 'true',
+    chatsDisabled: map.get('chats_disabled') === 'true',
+    mainAdminId: map.get('main_admin_id') ?? '',
+  };
+}
+
+/** Изменить настройку системы (админ). */
+export async function setAppSetting(key: string, value: string): Promise<void> {
+  const { error } = await supabase()
+    .from('app_settings')
+    .upsert({ key, value, updated_at: Date.now() }, { onConflict: 'key' });
+  if (error) throw new Error(error.message);
+  emit('settings:changed', { key, value });
+}
+
+/** Добавить подразделение. */
+export async function adminAddDepartment(name: string, kind = 'department'): Promise<void> {
+  const { error } = await supabase()
+    .from('departments')
+    .insert({ id: uid(), name: name.trim(), kind, sort_order: 999 });
+  if (error) throw new Error(error.message);
+}
+
+/** Переименовать подразделение. */
+export async function adminRenameDepartment(id: string, name: string): Promise<void> {
+  const { error } = await supabase()
+    .from('departments')
+    .update({ name: name.trim() })
+    .eq('id', id);
+  if (error) throw new Error(error.message);
+}
+
+/** Удалить подразделение. */
+export async function adminDeleteDepartment(id: string): Promise<void> {
+  const { error } = await supabase().from('departments').delete().eq('id', id);
+  if (error) throw new Error(error.message);
+}
+
+/** Пакетная смена взвода/группы у выбранных пользователей. */
+export async function adminBulkMoveGroup(userIds: string[], group: string): Promise<void> {
+  if (userIds.length === 0) return;
+  const { error } = await supabase()
+    .from('profiles')
+    .update({ group_name: group.trim() })
+    .in('id', userIds);
+  if (error) throw new Error(error.message);
+}
+
+/** Пакетное удаление пользователей (только админ). */
+export async function adminBulkDelete(userIds: string[]): Promise<void> {
+  for (const id of userIds) {
+    await adminDeleteUser(id);
+  }
+}
+
+/** Пакетный сброс пароля выбранным пользователям. */
+export async function adminBulkResetPassword(
+  userIds: string[],
+  newPassword: string,
+): Promise<{ ok: number; failed: number }> {
+  let ok = 0;
+  let failed = 0;
+  for (const id of userIds) {
+    try {
+      await adminResetPassword(id, newPassword);
+      ok += 1;
+    } catch {
+      failed += 1;
+    }
+  }
+  return { ok, failed };
+}
+
+export interface ImportUserRow {
+  fullName: string;
+  login: string;
+  password: string;
+  group: string;
+  rank?: string;
+  position?: string;
+  department?: string;
+  roleLevel?: number;
+}
+
+/** Импорт пользователей из CSV-строк. Возвращает отчёт по каждой строке. */
+export async function adminImportUsers(
+  rows: ImportUserRow[],
+): Promise<{ created: number; failed: Array<{ login: string; reason: string }> }> {
+  let created = 0;
+  const failed: Array<{ login: string; reason: string }> = [];
+  for (const row of rows) {
+    try {
+      const login = row.login.trim().toLowerCase();
+      if (!login || !row.fullName.trim()) throw new Error('пустое ФИО или логин');
+      const exists = (await unwrap(
+        supabase().from('profiles').select('id').eq('login', login).limit(1),
+      )) as { id: string }[];
+      if ((exists ?? []).length > 0) throw new Error('логин занят');
+
+      const password = row.password.trim() || 'test1234';
+      const hash = await hashPassword(login, password);
+      const id = uid();
+      const groupName = row.group?.trim() ?? '';
+      const positionName = row.position?.trim() || null;
+      const rankName =
+        row.rank?.trim() || autoAssignRankForGroup(groupName, positionName);
+      const { error: pErr } = await supabase().from('profiles').insert({
+        id,
+        login,
+        full_name: row.fullName.trim(),
+        group_name: groupName,
+        role: 'cadet',
+        military_rank: rankName,
+        position: positionName,
+        role_level: row.roleLevel ?? 1,
+        department: row.department?.trim() || null,
+        avatar_url: null,
+        created_at: Date.now(),
+      });
+      if (pErr) throw new Error(pErr.message);
+
+      const { error: cErr } = await supabase()
+        .from('credentials')
+        .insert({ profile_id: id, password_hash: hash });
+      if (cErr) throw new Error(cErr.message);
+
+      created += 1;
+    } catch (e) {
+      failed.push({ login: row.login, reason: e instanceof Error ? e.message : 'ошибка' });
+    }
+  }
+  return { created, failed };
+}
+
+

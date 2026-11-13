@@ -1,7 +1,7 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react';
 import { Check, CheckCheck, CornerUpLeft, Download, Pause, Play, X } from 'lucide-react';
 import * as db from '../lib/db';
-import { decryptEnvelope, decryptEnvelopeToString } from '../lib/crypto';
+import { decryptEnvelope, decryptEnvelopeToString, decryptGroupEnvelope } from '../lib/crypto';
 import type { Message, User } from '../types';
 
 function fmtTime(ts: number): string {
@@ -139,6 +139,33 @@ function useDecryptedMedia(
       return null;
     };
     (async () => {
+      // Групповое медиа: конверт из Storage или из старой таблицы media,
+      // ключ — из groupKeys (как у текста).
+      if (msg.groupKeys) {
+        try {
+          const envelope = msg.storagePath
+            ? await db.getStoredMediaEnvelope(msg.storagePath)
+            : await db.getMedia(msg.id);
+          if (!envelope) {
+            if (alive) setState({ url: null, failed: true, notFound: true });
+            return;
+          }
+          const buf = await decryptGroupEnvelope({
+            myId,
+            senderPublicKeyJwk: sender.publicKeyJwk,
+            groupKeys: msg.groupKeys,
+            envelope,
+          });
+          const blob = new Blob([buf], { type: msg.mimeType ?? 'application/octet-stream' });
+          url = URL.createObjectURL(blob);
+          if (alive) setState({ url, failed: false, notFound: false });
+          return;
+        } catch (err) {
+          console.warn('group media decrypt failed', err);
+          if (alive) setState({ url: null, failed: true, notFound: false });
+          return;
+        }
+      }
       // Приоритет: Storage (новые медиа), затем таблица media (старые сообщения).
       if (msg.storagePath) {
         try {
@@ -219,36 +246,28 @@ function Highlight({ text, query }: { text: string; query: string }) {
 
 // --- голосовое -------------------------------------------------------------
 
-function Waveform({
-  values,
-  progress,
-  onSeek,
-}: {
-  values: number[];
-  progress: number;
-  onSeek: (pct: number) => void;
-}) {
-  const bars = values.length > 0 ? values : Array.from({ length: 24 }, () => 0.35);
-  return (
-    <div
-      className="flex h-8 flex-1 cursor-pointer items-center gap-[2px]"
-      onClick={(e) => {
-        const rect = e.currentTarget.getBoundingClientRect();
-        onSeek(Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)));
-      }}
-    >
-      {bars.map((v, i) => {
-        const filled = i / bars.length <= progress;
-        return (
-          <span
-            key={i}
-            className={`w-[2px] shrink-0 rounded-full ${filled ? 'bg-accent' : 'bg-black/20'}`}
-            style={{ height: `${Math.max(12, Math.round(v * 100))}%` }}
-          />
-        );
-      })}
-    </div>
-  );
+const VOICE_BARS = 32;
+
+/** Сжать произвольную огибающую до фиксированного числа столбцов. */
+function resampleWaveform(values: number[], count = VOICE_BARS): number[] {
+  if (values.length === 0) {
+    return Array.from({ length: count }, (_, i) => 0.35 + 0.35 * Math.abs(Math.sin(i * 1.7)));
+  }
+  if (values.length <= count) {
+    const out = [...values];
+    while (out.length < count) out.push(values[out.length % values.length]);
+    return out;
+  }
+  const out: number[] = [];
+  const step = values.length / count;
+  for (let i = 0; i < count; i += 1) {
+    const from = Math.floor(i * step);
+    const to = Math.max(from + 1, Math.floor((i + 1) * step));
+    let sum = 0;
+    for (let j = from; j < to; j += 1) sum += values[j] ?? 0;
+    out.push(sum / (to - from));
+  }
+  return out;
 }
 
 function VoicePlayer({
@@ -264,38 +283,88 @@ function VoicePlayer({
   const [playing, setPlaying] = useState(false);
   const [current, setCurrent] = useState(0);
   const [knownDuration, setKnownDuration] = useState(duration ?? 0);
+  const [dragging, setDragging] = useState(false);
+
+  const bars = useMemo(() => resampleWaveform(waveform ?? []), [waveform]);
+  const total = knownDuration || duration || 0;
+  const progress = total > 0 ? Math.min(1, current / total) : 0;
 
   const toggle = () => {
     const audio = audioRef.current;
     if (!audio) return;
     if (playing) audio.pause();
-    else void audio.play();
+    else void audio.play().catch(() => setPlaying(false));
   };
 
-  const seek = (pct: number) => {
+  const seekAt = (clientX: number, rect: DOMRect) => {
     const audio = audioRef.current;
-    if (!audio || !knownDuration) return;
-    audio.currentTime = pct * knownDuration;
-    setCurrent(audio.currentTime);
+    if (!audio) return;
+    const pct = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+    const dur = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : total;
+    if (!dur) return;
+    audio.currentTime = pct * dur;
+    setCurrent(pct * dur);
   };
-
-  const total = knownDuration || duration || 0;
-  const progress = total > 0 ? Math.min(1, current / total) : 0;
 
   return (
-    <div className="flex items-center gap-2" style={{ width: 200 }}>
+    <div
+      className="flex items-center gap-2.5"
+      style={{ width: 236 }}
+      onPointerDown={(e) => e.stopPropagation()}
+      onContextMenu={(e) => e.stopPropagation()}
+    >
       <button
         type="button"
         onClick={toggle}
-        className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent text-white"
+        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-accent text-white shadow-sm transition-transform active:scale-95"
         aria-label={playing ? 'Пауза' : 'Воспроизвести'}
       >
-        {playing ? <Pause size={14} /> : <Play size={14} className="ml-0.5" />}
+        {playing ? <Pause size={16} /> : <Play size={16} className="ml-0.5" />}
       </button>
-      <Waveform values={waveform ?? []} progress={progress} onSeek={seek} />
-      <span className="shrink-0 text-[13px] tabular-nums">
-        {fmtDuration(current > 0 ? current : total)}
-      </span>
+
+      <div className="min-w-0 flex-1">
+        <div
+          className="flex h-9 cursor-pointer touch-none items-center gap-[2px]"
+          role="slider"
+          aria-label="Перемотка голосового"
+          aria-valuemin={0}
+          aria-valuemax={Math.round(total)}
+          aria-valuenow={Math.round(current)}
+          onPointerDown={(e) => {
+            e.stopPropagation();
+            e.currentTarget.setPointerCapture(e.pointerId);
+            setDragging(true);
+            seekAt(e.clientX, e.currentTarget.getBoundingClientRect());
+          }}
+          onPointerMove={(e) => {
+            if (!dragging) return;
+            seekAt(e.clientX, e.currentTarget.getBoundingClientRect());
+          }}
+          onPointerUp={(e) => {
+            e.currentTarget.releasePointerCapture(e.pointerId);
+            setDragging(false);
+          }}
+          onPointerCancel={() => setDragging(false)}
+        >
+          {bars.map((v, i) => {
+            const played = i / bars.length < progress;
+            return (
+              <span
+                key={i}
+                className={`w-[3px] shrink-0 rounded-full transition-[height,background-color] duration-150 ${
+                  played ? 'bg-accent' : 'bg-text-muted/35'
+                }`}
+                style={{ height: `${Math.max(18, Math.round(v * 100))}%` }}
+              />
+            );
+          })}
+        </div>
+        <div className="mt-0.5 flex items-center justify-between text-[11px] tabular-nums text-text-muted">
+          <span>{fmtDuration(playing || current > 0 ? current : total)}</span>
+          <span>{fmtDuration(total)}</span>
+        </div>
+      </div>
+
       <audio
         ref={audioRef}
         src={url}
@@ -322,19 +391,31 @@ function PhotoContent({ url }: { url: string }) {
   const [full, setFull] = useState(false);
   return (
     <>
-      <button type="button" onClick={() => setFull(true)} className="block">
+      <button
+        type="button"
+        onClick={() => setFull(true)}
+        onPointerDown={(e) => e.stopPropagation()}
+        className="block overflow-hidden rounded-lg"
+      >
         <img
           src={url}
           alt="Фото"
-          className="max-w-[240px] cursor-pointer rounded-lg"
+          className="max-h-[260px] max-w-[240px] cursor-pointer rounded-lg object-cover"
           loading="lazy"
         />
       </button>
       {full && (
-        <div className="fixed inset-0 z-[60] flex flex-col items-center justify-center gap-4 bg-black/90 p-4">
+        <div
+          className="fixed inset-0 z-[80] flex flex-col items-center justify-center gap-4 bg-black/90 p-4"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={() => setFull(false)}
+        >
           <button
             type="button"
-            onClick={() => setFull(false)}
+            onClick={(e) => {
+              e.stopPropagation();
+              setFull(false);
+            }}
             className="absolute right-4 top-4 rounded-lg p-2 text-white/80 hover:bg-white/10 hover:text-white"
             aria-label="Закрыть"
           >
@@ -343,11 +424,13 @@ function PhotoContent({ url }: { url: string }) {
           <img
             src={url}
             alt="Фото"
-            className="max-h-[80vh] max-w-[90vw] rounded-lg object-contain"
+            onClick={(e) => e.stopPropagation()}
+            className="max-h-[80vh] max-w-[92vw] rounded-lg object-contain"
           />
           <a
             href={url}
             download={`svyaz-photo-${Date.now()}.jpg`}
+            onClick={(e) => e.stopPropagation()}
             className="inline-flex items-center gap-2 rounded-lg border border-white/30 px-3 py-2 text-[15px] text-white hover:bg-white/10"
           >
             <Download size={16} />
@@ -362,64 +445,167 @@ function PhotoContent({ url }: { url: string }) {
 function CircleContent({ url, duration }: { url: string; duration?: number }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [playing, setPlaying] = useState(false);
-
-  const play = async () => {
-    const v = videoRef.current;
-    if (!v) return;
-    try {
-      await v.play();
-    } catch {
-      // Если метаданные ещё не загружены — перезагружаем и пробуем снова.
-      v.load();
-      try {
-        await v.play();
-      } catch {
-        /* авто­проигрывание после тапа должно сработать повторной попыткой */
-      }
-    }
-  };
+  const [progress, setProgress] = useState(0);
+  const [current, setCurrent] = useState(0);
 
   const toggle = () => {
     const v = videoRef.current;
     if (!v) return;
     if (playing) v.pause();
-    else void play();
+    else void v.play().catch(() => setPlaying(false));
   };
 
+  const total = duration ?? 0;
+  const ringR = 96;
+  const ringLength = 2 * Math.PI * ringR;
+
   return (
-    <button
-      type="button"
-      onClick={toggle}
-      className="relative block h-[200px] w-[200px] overflow-hidden rounded-full border border-border"
-      aria-label="Кружок"
+    <div
+      className="relative h-[200px] w-[200px] shrink-0 select-none"
+      onPointerDown={(e) => e.stopPropagation()}
+      onContextMenu={(e) => e.stopPropagation()}
+    >
+      <div className="absolute inset-0 overflow-hidden rounded-full border border-white/20 bg-black">
+        <video
+          ref={videoRef}
+          src={url}
+          loop
+          playsInline
+          preload="metadata"
+          onClick={toggle}
+          className="h-full w-full cursor-pointer object-cover"
+          onPlay={() => setPlaying(true)}
+          onPause={() => setPlaying(false)}
+          onTimeUpdate={(e) => {
+            const v = e.currentTarget;
+            setCurrent(v.currentTime);
+            const dur = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : total;
+            setProgress(dur > 0 ? Math.min(1, v.currentTime / dur) : 0);
+          }}
+          onEnded={() => {
+            setPlaying(false);
+            setProgress(0);
+            setCurrent(0);
+          }}
+        />
+      </div>
+
+      {/* прогресс-кольцо вокруг кружка */}
+      <svg
+        viewBox="0 0 200 200"
+        className="pointer-events-none absolute inset-0 -rotate-90"
+        aria-hidden="true"
+      >
+        <circle cx="100" cy="100" r={ringR} fill="none" stroke="rgba(255,255,255,0.22)" strokeWidth="3" />
+        <circle
+          cx="100"
+          cy="100"
+          r={ringR}
+          fill="none"
+          stroke="currentColor"
+          className="text-accent"
+          strokeWidth="3"
+          strokeLinecap="round"
+          strokeDasharray={ringLength}
+          strokeDashoffset={ringLength * (1 - progress)}
+        />
+      </svg>
+
+      {!playing && (
+        <span className="pointer-events-none absolute inset-0 flex items-center justify-center">
+          <span className="flex h-14 w-14 items-center justify-center rounded-full bg-black/45 backdrop-blur-sm">
+            <Play size={26} className="ml-1 text-white" />
+          </span>
+        </span>
+      )}
+
+      <span className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-black/55 px-2 py-0.5 text-[12px] tabular-nums text-white">
+        {fmtDuration(playing || current > 0 ? current : total)}
+      </span>
+    </div>
+  );
+}
+
+/** Видео в ленте: свой прогресс-бар, тап по кадру — пауза/воспроизведение. */
+function VideoContent({ url, duration }: { url: string; duration?: number }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [playing, setPlaying] = useState(false);
+  const [current, setCurrent] = useState(0);
+  const [total, setTotal] = useState(duration ?? 0);
+
+  const toggle = () => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (playing) v.pause();
+    else void v.play().catch(() => setPlaying(false));
+  };
+
+  const seekAt = (clientX: number, rect: DOMRect) => {
+    const v = videoRef.current;
+    if (!v || !total) return;
+    const pct = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+    v.currentTime = pct * total;
+    setCurrent(v.currentTime);
+  };
+
+  const progress = total > 0 ? Math.min(1, current / total) : 0;
+
+  return (
+    <div
+      className="relative w-[240px] overflow-hidden rounded-xl bg-black"
+      onPointerDown={(e) => e.stopPropagation()}
+      onContextMenu={(e) => e.stopPropagation()}
     >
       <video
         ref={videoRef}
         src={url}
-        loop
-        muted
         playsInline
-        preload="auto"
-        onClick={(e) => {
-          // Сам элемент перехватывает клик внутри кнопки — дублируем toggle.
-          e.stopPropagation();
-          toggle();
-        }}
-        className="h-full w-full object-cover"
+        preload="metadata"
+        onClick={toggle}
+        className="block max-h-[320px] w-full cursor-pointer object-contain"
         onPlay={() => setPlaying(true)}
         onPause={() => setPlaying(false)}
+        onTimeUpdate={(e) => setCurrent(e.currentTarget.currentTime)}
+        onLoadedMetadata={(e) => {
+          if (Number.isFinite(e.currentTarget.duration)) setTotal(e.currentTarget.duration);
+        }}
+        onEnded={() => {
+          setPlaying(false);
+          setCurrent(0);
+        }}
       />
+
       {!playing && (
-        <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/30">
-          <Play size={36} className="text-white" />
+        <span className="pointer-events-none absolute inset-0 flex items-center justify-center">
+          <span className="flex h-12 w-12 items-center justify-center rounded-full bg-black/45 backdrop-blur-sm">
+            <Play size={22} className="ml-1 text-white" />
+          </span>
         </span>
       )}
-      {duration !== undefined && (
-        <span className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-black/50 px-2 py-0.5 text-[13px] text-white">
-          {fmtDuration(duration)}
+
+      <div className="absolute inset-x-0 bottom-0 flex items-center gap-2 bg-gradient-to-t from-black/75 to-transparent px-2 pb-1.5 pt-6">
+        <span className="shrink-0 text-[11px] tabular-nums text-white">
+          {fmtDuration(current)}
         </span>
-      )}
-    </button>
+        <div
+          className="h-1 flex-1 cursor-pointer rounded-full bg-white/30"
+          onClick={(e) => seekAt(e.clientX, e.currentTarget.getBoundingClientRect())}
+          role="slider"
+          aria-label="Перемотка видео"
+          aria-valuemin={0}
+          aria-valuemax={Math.round(total)}
+          aria-valuenow={Math.round(current)}
+        >
+          <div
+            className="h-full rounded-full bg-accent"
+            style={{ width: `${progress * 100}%` }}
+          />
+        </div>
+        <span className="shrink-0 text-[11px] tabular-nums text-white/85">
+          {fmtDuration(total)}
+        </span>
+      </div>
+    </div>
   );
 }
 
@@ -514,6 +700,8 @@ export interface MessageBubbleProps {
   myId: string;
   /** публичный ключ собеседника — для чтения своих сообщений старого формата */
   peerPublicKeyJwk?: JsonWebKey;
+  /** показывать имя автора (для групповых чатов) */
+  showSenderName?: boolean;
   highlight?: string;
   /** долгое нажатие / правая кнопка мыши */
   onLongPress?: (msg: Message) => void;
@@ -525,6 +713,7 @@ export function MessageBubble({
   own,
   myId,
   peerPublicKeyJwk,
+  showSenderName = false,
   highlight = '',
   onLongPress,
 }: MessageBubbleProps) {
@@ -580,6 +769,9 @@ export function MessageBubble({
           own ? 'bg-own' : 'bg-other'
         } ${deleted ? 'italic text-text-muted' : 'text-text'}`}
       >
+        {showSenderName && !deleted && (
+          <div className="mb-0.5 truncate text-[12px] font-medium text-accent">{sender.fullName}</div>
+        )}
         {msg.replyToId && !deleted && (
           <ReplyQuote
             msg={msg}
@@ -692,9 +884,7 @@ function MediaContent({
     case 'photo':
       return <PhotoContent url={url} />;
     case 'video':
-      return (
-        <video src={url} controls preload="metadata" className="max-w-[240px] rounded-lg" />
-      );
+      return <VideoContent url={url} duration={msg.duration} />;
     case 'circle':
       return <CircleContent url={url} duration={msg.duration} />;
     default:

@@ -16,7 +16,9 @@ export type BusEventType =
   | 'typing'
   | 'presence'
   | 'keys:updated'
-  | 'avatar:updated';
+  | 'avatar:updated'
+  | 'broadcast:new'
+  | 'settings:changed';
 
 export interface BusEvent {
   type: BusEventType;

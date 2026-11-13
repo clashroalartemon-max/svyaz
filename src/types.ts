@@ -1,5 +1,57 @@
 export type Role = 'cadet' | 'admin';
 
+/** Звания (в порядке старшинства) */
+export const RANKS = [
+  'курсант',
+  'рядовой',
+  'ефрейтор',
+  'младший сержант',
+  'сержант',
+  'старший сержант',
+  'старшина',
+  'прапорщик',
+  'старший прапорщик',
+  'младший лейтенант',
+  'лейтенант',
+  'старший лейтенант',
+  'капитан',
+  'майор',
+  'подполковник',
+  'полковник',
+  'генерал-майор',
+  'генерал-лейтенант',
+  'генерал-полковник',
+] as const;
+
+export type Rank = (typeof RANKS)[number];
+
+/** Должности */
+export const POSITIONS = [
+  'курсант',
+  'староста группы',
+  'командир отделения',
+  'заместитель командира взвода',
+  'командир взвода',
+  'начальник курса',
+  'преподаватель',
+  'доцент кафедры',
+  'начальник кафедры',
+  'начальник факультета',
+  'начальник университета',
+] as const;
+
+export type Position = (typeof POSITIONS)[number];
+
+/** Тип чата: личный или групповой/системный */
+export type ChatKind =
+  | 'direct'
+  | 'squad'
+  | 'commander'
+  | 'course'
+  | 'teachers'
+  | 'group'
+  | 'broadcast';
+
 /** Режим темы: светлая / тёмная / как в системе */
 export type ThemeMode = 'light' | 'dark' | 'system';
 
@@ -9,6 +61,18 @@ export interface User {
   fullName: string;
   group: string;
   role: Role;
+  /** звание (например «рядовой», «сержант», «лейтенант») */
+  rank?: string;
+  /** должность (например «курсант», «командир взвода») */
+  position?: string;
+  /** уровень прав: 1 — курсант, 10 — начальник университета */
+  roleLevel?: number;
+  /** уникальный ник, задаёт сам пользователь */
+  username?: string;
+  /** подразделение (факультет / кафедра / управление) из таблицы departments */
+  department?: string;
+  /** контактный телефон */
+  phone?: string;
   publicKeyJwk: JsonWebKey;
   avatarUrl?: string;
   createdAt: number;
@@ -58,17 +122,28 @@ export interface Message extends EnvelopeFields {
   storagePath?: string;
   /** ответ на сообщение: id исходного сообщения, на которое отвечают */
   replyToId?: string;
+  /** групповое шифрование: ключ контента для каждого участника чата */
+  groupKeys?: Record<string, { w: string; i: string }>;
   createdAt: number;
 }
 
 export interface Chat {
   id: string;
-  participants: [string, string];
+  /** все участники чата (у 1:1 — два) */
+  participants: string[];
   createdAt: number;
+  /** создатель чата (для групповых) */
+  ownerId?: string;
   /** системный чат «Избранное» (переписка с самим собой) */
   saved?: boolean;
   /** секретный чат: сообщения удаляются автоматически через 24 часа */
   secret?: boolean;
+  /** тип чата: direct / squad / commander / course / teachers / group / broadcast */
+  kind?: ChatKind;
+  /** название группового чата */
+  title?: string;
+  /** целевая группа (например «152» или «курс 1») */
+  target?: string;
 }
 
 export interface ChatListItem {
@@ -76,4 +151,17 @@ export interface ChatListItem {
   peer: User;
   lastMessage: Message | null;
   unread: number;
+}
+
+/** Оповещение (рассылка) — сохраняется отдельно от чатов. */
+export interface Broadcast {
+  id: string;
+  senderId: string;
+  /** цель: взвод / курс / факультет / университет / выборочно из контактов */
+  targetType: 'squad' | 'course' | 'faculty' | 'university' | 'custom';
+  targetValue?: string;
+  text: string;
+  targetUserIds?: string[];
+  createdAt: number;
+  read?: boolean;
 }

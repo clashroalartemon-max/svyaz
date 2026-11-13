@@ -20,6 +20,7 @@ export function SearchPage() {
 
   const [fullName, setFullName] = useState('');
   const [group, setGroup] = useState('');
+  const [username, setUsername] = useState('');
   const [results, setResults] = useState<User[]>([]);
   const [searched, setSearched] = useState(false);
   const [searching, setSearching] = useState(false);
@@ -33,6 +34,13 @@ export function SearchPage() {
     setError(null);
     setBusyId(null);
     try {
+      // Приоритет: поиск по нику (точное совпадение), если ник указан.
+      if (username.trim()) {
+        const found = await db.searchUserByUsername(username);
+        setResults(found ? [found] : []);
+        setSearched(true);
+        return;
+      }
       const found = await db.searchUsers({ fullName, group });
       setResults(found);
       setSearched(true);
@@ -75,6 +83,17 @@ export function SearchPage() {
       <div className="mx-auto w-full max-w-lg flex-1 overflow-y-auto p-4">
         <form onSubmit={(e) => void search(e)} className="flex flex-col gap-4">
           <Input
+            label="Поиск по нику (точное совпадение)"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            placeholder="например, smirnov_152"
+          />
+          <div className="flex items-center gap-2 text-[13px] text-text-muted">
+            <span className="h-px flex-1 bg-border" />
+            или по ФИО и взводу
+            <span className="h-px flex-1 bg-border" />
+          </div>
+          <Input
             label="ФИО (полностью)"
             value={fullName}
             onChange={(e) => setFullName(e.target.value)}
@@ -95,7 +114,9 @@ export function SearchPage() {
           {error && <p className="text-[13px] text-danger">{error}</p>}
           {searched && results.length === 0 && !error && (
             <p className="text-center text-[13px] text-text-muted">
-              Никого не найдено. Поиск идёт по точному совпадению ФИО и группы.
+              {username.trim()
+                ? `Ник @${username.trim()} не найден`
+                : 'Никого не найдено. Поиск идёт по точному совпадению ФИО и группы.'}
             </p>
           )}
           {results.length > 0 && (

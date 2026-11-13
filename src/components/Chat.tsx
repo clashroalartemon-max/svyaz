@@ -18,7 +18,7 @@ import {
   X,
 } from 'lucide-react';
 import * as db from '../lib/db';
-import { encryptFor } from '../lib/crypto';
+import { encryptFor, encryptForGroup } from '../lib/crypto';
 import {
   useAuth,
   useChat,
@@ -31,9 +31,11 @@ import {
   usePeerTyping,
   useTypingNotifier,
 } from '../hooks';
-import { Avatar } from '../ui';
+import { emit } from '../lib/bus';
+import { Avatar, InfoButton, RankBadge } from '../ui';
 import { MessageBubble } from './MessageBubble';
 import {
+  AddParticipantModal,
   ChatSettingsModal,
   CircleCaptureModal,
   MAX_CIRCLE_SECONDS,
@@ -135,22 +137,41 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
   const navigate = useNavigate();
   const myId = useAuth();
   const me = useCurrentUser();
-  const { chat, loaded: chatLoaded } = useChat(chatId);
+  const { chat, loaded: chatLoaded, error: chatError } = useChat(chatId);
   const peer = usePeer(chat, myId);
   const messages = useMessages(chatId);
   const isDesktop = useMediaQuery('(min-width: 900px)');
   const isSaved = chat?.saved === true;
+  // Групповой — по типу чата, а не по числу людей: группа может состоять из
+  // двух человек, но остаётся группой (своё название и настройки).
+  const isGroupKind =
+    chat?.kind === 'squad' ||
+    chat?.kind === 'teachers' ||
+    chat?.kind === 'group' ||
+    chat?.kind === 'broadcast';
+  const isGroup = isGroupKind && !isSaved;
+  const isGroupChat = isGroup && !isSaved;
 
-  const online = useOnline(isSaved ? null : peer?.id ?? null);
-  const peerTyping = usePeerTyping(chatId, isSaved ? null : peer?.id ?? null);
+  // Добавлять участников может владелец чата, а командный состав —
+  // ещё и в чаты взвода / курса / преподавателей.
+  const canAddMembers =
+    !isSaved &&
+    !!chat &&
+    ((chat.ownerId !== undefined && chat.ownerId === myId) ||
+      ((me?.roleLevel ?? 1) > 1 && isGroupKind));
+
+  const groupPeerId = isGroupChat ? null : peer?.id ?? null;
+  const online = useOnline(isSaved ? null : groupPeerId);
+  const peerTyping = usePeerTyping(chatId, isSaved ? null : groupPeerId);
   // При открытии чата обновляем публичные ключи участников (офлайн-расшифровка).
-  useFreshKeysOnChatOpen(chatId, myId, isSaved ? null : peer?.id ?? null);
+  useFreshKeysOnChatOpen(chatId, myId, isSaved ? null : groupPeerId);
 
   const [text, setText] = useState('');
   const [menuOpen, setMenuOpen] = useState(false);
   const [photoOpen, setPhotoOpen] = useState(false);
   const [circleOpen, setCircleOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [addMembersOpen, setAddMembersOpen] = useState(false);
   const [actionMsg, setActionMsg] = useState<Message | null>(null);
   const [editing, setEditing] = useState<Message | null>(null);
   const [replyTo, setReplyTo] = useState<Message | null>(null);
@@ -160,8 +181,58 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
   const [activeSearchIndex, setActiveSearchIndex] = useState(0);
   const [busy, setBusy] = useState(false);
 
+  // Архив текущего чата: показываем кнопку «Разархивировать» в настройках
+  const [isArchived, setIsArchived] = useState(false);
+  useEffect(() => {
+    if (!myId) {
+      setIsArchived(false);
+      return;
+    }
+    let alive = true;
+    void db.getArchivedChatIds(myId).then((ids) => {
+      if (alive) setIsArchived(ids.includes(chatId));
+    });
+    return () => {
+      alive = false;
+    };
+  }, [myId, chatId]);
+
+  const unarchiveCurrent = async () => {
+    if (!myId) return;
+    try {
+      await db.unarchiveChat(myId, chatId);
+      setIsArchived(false);
+      setSettingsOpen(false);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Не удалось разархивировать чат');
+    }
+  };
+
   const [recording, setRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
+
+  // Для группового чата: карта senderId → профиль (имена авторов в ленте)
+  const [senders, setSenders] = useState<Map<string, User>>(new Map());
+  useEffect(() => {
+    if (!isGroup || !myId || messages.length === 0) {
+      setSenders(new Map());
+      return;
+    }
+    let alive = true;
+    const ids = new Set(messages.map((m) => m.senderId));
+    (async () => {
+      const map = new Map<string, User>();
+      for (const id of ids) {
+        if (id === myId) continue;
+        const u = await db.getUserById(id);
+        if (alive && u) map.set(id, u);
+      }
+      if (alive) setSenders(map);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [isGroup, myId, messages]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -327,10 +398,23 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
     return { me: freshMe, peer: freshPeer };
   };
 
+  /** Все участники группового чата с публичными ключами (для E2EE в группе) */
+  const resolveGroupMembers = async (): Promise<Array<{ id: string; publicKeyJwk: JsonWebKey }> | null> => {
+    if (!chat || !chat.participants || chat.participants.length === 0) return null;
+    const members: Array<{ id: string; publicKeyJwk: JsonWebKey }> = [];
+    for (const id of chat.participants) {
+      const fresh = (await db.ensureUserKeyPair(id)) ?? (await db.getUserById(id));
+      if (fresh) members.push({ id: fresh.id, publicKeyJwk: fresh.publicKeyJwk });
+    }
+    return members.length > 0 ? members : null;
+  };
+
   const sendText = async (value: string) => {
     const trimmed = value.trim();
-    // Пустые сообщения (только пробелы) не отправляются.
-    if (!trimmed || !peer || !me || !myId || sendingRef.current) return;
+    // Пустые сообщения (только пробелы) не отправляются. Собеседник обязателен
+    // только для личного чата: у группы его может не быть вовсе.
+    if (!trimmed || !me || !myId || sendingRef.current) return;
+    if (!isGroup && !peer) return;
     if (floodLimited()) return;
     const replyToId = replyTo?.id;
     sendingRef.current = true;
@@ -349,18 +433,30 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
     // Сразу показываем сообщение в ленте (оптимистичный UI), шифруем и пишем в базу.
     setReplyTo(null);
     try {
-      const keys = await resolveKeys();
-      if (!keys) throw new Error('не удалось определить участников чата');
-      const envelope = await encryptFor({
-        myId,
-        myPublicKeyJwk: keys.me.publicKeyJwk,
-        peerPublicKeyJwk: keys.peer.publicKeyJwk,
-        data: trimmed,
-      });
-      const fullMsg: Message = { ...optimisticMsg, ...envelope };
+      let fullMsg: Message;
+      if (isGroup) {
+        const members = await resolveGroupMembers();
+        if (!members) throw new Error('не удалось определить участников чата');
+        const group = await encryptForGroup({
+          myId,
+          myPublicKeyJwk: me.publicKeyJwk,
+          members,
+          data: trimmed,
+        });
+        fullMsg = { ...optimisticMsg, ...group };
+      } else {
+        const keys = await resolveKeys();
+        if (!keys) throw new Error('не удалось определить участников чата');
+        const envelope = await encryptFor({
+          myId,
+          myPublicKeyJwk: keys.me.publicKeyJwk,
+          peerPublicKeyJwk: keys.peer.publicKeyJwk,
+          data: trimmed,
+        });
+        fullMsg = { ...optimisticMsg, ...envelope };
+      }
       await db.saveMessageOptimistic(fullMsg, (e) => {
         console.error('sendText optimistic error', e);
-        alert('Не удалось отправить сообщение: нет соединения. Повторите попытку.');
       });
       scrollToBottom();
     } catch (e) {
@@ -405,15 +501,29 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
     if (!trimmed) return;
     setBusy(true);
     try {
-      const keys = await resolveKeys();
-      if (!keys) throw new Error('не удалось определить участников чата');
-      const envelope = await encryptFor({
-        myId,
-        myPublicKeyJwk: keys.me.publicKeyJwk,
-        peerPublicKeyJwk: keys.peer.publicKeyJwk,
-        data: trimmed,
-      });
-      await db.updateMessage(editing.id, { ...envelope, editedAt: Date.now() });
+      let patch: Parameters<typeof db.updateMessage>[1];
+      if (isGroup) {
+        const members = await resolveGroupMembers();
+        if (!members) throw new Error('не удалось определить участников чата');
+        const group = await encryptForGroup({
+          myId,
+          myPublicKeyJwk: me.publicKeyJwk,
+          members,
+          data: trimmed,
+        });
+        patch = { ...group, editedAt: Date.now() };
+      } else {
+        const keys = await resolveKeys();
+        if (!keys) throw new Error('не удалось определить участников чата');
+        const envelope = await encryptFor({
+          myId,
+          myPublicKeyJwk: keys.me.publicKeyJwk,
+          peerPublicKeyJwk: keys.peer.publicKeyJwk,
+          data: trimmed,
+        });
+        patch = { ...envelope, editedAt: Date.now() };
+      }
+      await db.updateMessage(editing.id, patch);
       setEditing(null);
       setText('');
     } catch {
@@ -430,20 +540,35 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
     blob: Blob,
     extra?: { duration?: number; waveform?: number[] },
   ) => {
-    if (!peer || !me || !myId || mediaSendingRef.current) return;
+    if ((!peer && !isGroup) || !me || !myId || mediaSendingRef.current) return;
     if (floodLimited()) return;
     mediaSendingRef.current = true;
     setBusy(true);
     try {
-      const keys = await resolveKeys();
-      if (!keys) throw new Error('не удалось определить участников чата');
       const buf = await blob.arrayBuffer();
-      const envelope = await encryptFor({
-        myId,
-        myPublicKeyJwk: keys.me.publicKeyJwk,
-        peerPublicKeyJwk: keys.peer.publicKeyJwk,
-        data: buf,
-      });
+      let envelope: Parameters<typeof db.saveMediaMessage>[1];
+      let groupKeys: Message['groupKeys'];
+      if (isGroup) {
+        const members = await resolveGroupMembers();
+        if (!members) throw new Error('не удалось определить участников чата');
+        const group = await encryptForGroup({
+          myId,
+          myPublicKeyJwk: me.publicKeyJwk,
+          members,
+          data: buf,
+        });
+        envelope = group;
+        groupKeys = group.groupKeys;
+      } else {
+        const keys = await resolveKeys();
+        if (!keys) throw new Error('не удалось определить участников чата');
+        envelope = await encryptFor({
+          myId,
+          myPublicKeyJwk: keys.me.publicKeyJwk,
+          peerPublicKeyJwk: keys.peer.publicKeyJwk,
+          data: buf,
+        });
+      }
       await db.saveMediaMessage(
         {
           id: newId(),
@@ -454,6 +579,7 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
           mimeType: blob.type || 'application/octet-stream',
           duration: extra?.duration,
           waveform: extra?.waveform,
+          groupKeys,
           createdAt: Date.now(),
         },
         envelope,
@@ -742,6 +868,24 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
     return <div className="flex h-full items-center justify-center text-text-muted">Загрузка…</div>;
   }
 
+  if (chatError) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+        <div className="text-[15px] text-text">Не удалось загрузить чат</div>
+        <div className="max-w-[320px] text-[13px] text-text-muted">
+          Проверьте соединение с интернетом и попробуйте ещё раз.
+        </div>
+        <button
+          type="button"
+          onClick={() => emit('chat:updated', {})}
+          className="rounded-lg border border-border px-3 py-2 text-[15px] text-text hover:bg-surface"
+        >
+          Повторить
+        </button>
+      </div>
+    );
+  }
+
   if (!chat) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
@@ -760,12 +904,27 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
     );
   }
 
+  // Собеседник нужен шапке и аватару. У группы он тоже есть — любой
+  // участник, кроме меня; если его нет, показываем «Загрузка…».
   if (!peer) {
     return <div className="flex h-full items-center justify-center text-text-muted">Загрузка…</div>;
   }
 
-  const title = isSaved ? 'Избранное' : peer.fullName;
-  const subtitle = peerTyping ? 'печатает…' : isSaved ? 'Личные заметки' : peer.group;
+  const title = isSaved ? 'Избранное' : isGroup ? (chat.title ?? peer.fullName) : peer.fullName;
+  const members = chat.participants?.length ?? 0;
+  const membersLabel =
+    members % 10 === 1 && members % 100 !== 11
+      ? `${members} участник`
+      : members % 10 >= 2 && members % 10 <= 4 && (members % 100 < 12 || members % 100 > 14)
+        ? `${members} участника`
+        : `${members} участников`;
+  const subtitle = peerTyping
+    ? 'печатает…'
+    : isSaved
+      ? 'Личные заметки'
+      : isGroupChat
+        ? membersLabel
+        : [peer.position, peer.department].filter(Boolean).join(' · ') || peer.group;
 
   return (
     <div className="flex h-full min-w-0 flex-col bg-bg">
@@ -782,36 +941,54 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
           </button>
         )}
 
-        <button
-          type="button"
-          onClick={() => navigate(`/profile/${chatId}`)}
-          className="flex min-w-0 flex-1 items-center gap-2 rounded-lg pr-1 text-left hover:bg-surface/60"
-          aria-label="Открыть профиль"
-        >
-          <div className="relative shrink-0">
-            <Avatar
-              name={title}
-              size="sm"
-              seed={isSaved ? `${myId}-saved` : peer.id}
-              src={isSaved ? undefined : peer.avatarUrl}
-            />
-            {!isSaved && online && (
-              <span
-                className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-bg bg-green-500"
-                title="Онлайн"
-                aria-label="Онлайн"
+        {!isGroupChat && !isSaved && (
+          <button
+            type="button"
+            onClick={() => navigate(`/profile/${chatId}`)}
+            className="flex min-w-0 flex-1 items-center gap-2 rounded-lg pr-1 text-left hover:bg-surface/60"
+            aria-label="Открыть профиль"
+          >
+            <div className="relative shrink-0">
+              <Avatar
+                name={title}
+                size="sm"
+                seed={isSaved ? `${myId}-saved` : peer.id}
+                src={isSaved ? undefined : peer.avatarUrl}
               />
-            )}
-          </div>
+              {!isSaved && online && (
+                <span
+                  className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-bg bg-green-500"
+                  title="Онлайн"
+                  aria-label="Онлайн"
+                />
+              )}
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 items-center gap-1.5">
+                <span className="truncate text-[15px] font-medium text-text">{title}</span>
+                {!isSaved && peer.rank && <RankBadge rank={peer.rank} size="sm" />}
+              </div>
+              <div
+                className={`truncate text-[13px] ${peerTyping ? 'text-accent' : 'text-text-muted'}`}
+              >
+                {subtitle}
+              </div>
+            </div>
+          </button>
+        )}
+        {isGroupChat && (
           <div className="min-w-0 flex-1">
             <div className="truncate text-[15px] font-medium text-text">{title}</div>
-            <div
-              className={`truncate text-[13px] ${peerTyping ? 'text-accent' : 'text-text-muted'}`}
-            >
-              {subtitle}
-            </div>
+            <div className="truncate text-[13px] text-text-muted">{subtitle}</div>
           </div>
-        </button>
+        )}
+
+        {!isSaved && !isGroupChat && (
+          <InfoButton
+            user={peer}
+            title="Информация о пользователе"
+          />
+        )}
 
         <button
           type="button"
@@ -960,10 +1137,11 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
             >
               <MessageBubble
                 msg={m}
-                sender={m.senderId === myId ? me : peer}
+                sender={m.senderId === myId ? me : (isGroupChat ? (senders.get(m.senderId) ?? peer) : peer)}
                 own={m.senderId === myId}
                 myId={myId ?? ''}
                 peerPublicKeyJwk={isSaved ? me.publicKeyJwk : peer.publicKeyJwk}
+                showSenderName={isGroupChat && m.senderId !== myId}
                 highlight={searchOpen ? searchQuery : ''}
                 onLongPress={openActions}
               />
@@ -1124,10 +1302,27 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
           title={title}
           secret={chat.secret === true}
           busy={busy}
+          archived={isArchived}
+          canAddMembers={canAddMembers}
+          onAddMembers={() => {
+            setSettingsOpen(false);
+            setAddMembersOpen(true);
+          }}
           onToggleSecret={() => void toggleSecret()}
           onExport={() => void exportTranscript()}
           onClear={() => void clearHistory()}
+          onUnarchive={isArchived ? () => void unarchiveCurrent() : null}
           onClose={() => setSettingsOpen(false)}
+        />
+      )}
+      {addMembersOpen && chat && (
+        <AddParticipantModal
+          chatId={chat.id}
+          existingIds={chat.participants}
+          onAdded={() => {
+            setAddMembersOpen(false);
+          }}
+          onClose={() => setAddMembersOpen(false)}
         />
       )}
       {actionMsg && (

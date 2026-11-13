@@ -24,10 +24,24 @@ export function useCurrentUser(): User | null {
       setUser(null);
       return;
     }
-    const fetch = () =>
-      db.getUserById(userId).then((u) => {
-        if (alive) setUser(u);
-      });
+    // Сетевой сбой не должен оставлять экран пустым навсегда: повторяем
+    // загрузку профиля с нарастающей паузой, пока он не придёт.
+    let attempt = 0;
+    let timer: number | null = null;
+    const fetch = () => {
+      db.getUserById(userId)
+        .then((u) => {
+          if (!alive) return;
+          setUser(u);
+          attempt = 0;
+        })
+        .catch(() => {
+          if (!alive) return;
+          attempt += 1;
+          const delay = Math.min(15000, 800 * attempt);
+          timer = window.setTimeout(fetch, delay);
+        });
+    };
     void fetch();
     // Свежее ФИО/аватар/группа после их изменения на любом устройстве.
     const unsub = on('avatar:updated', () => {
@@ -36,6 +50,7 @@ export function useCurrentUser(): User | null {
     return () => {
       alive = false;
       unsub();
+      if (timer !== null) window.clearTimeout(timer);
     };
   }, [userId]);
   return user;
@@ -151,11 +166,27 @@ export function useChats(userId: string | null): ChatListItem[] {
       return;
     }
     let alive = true;
-    db.getUserChats(userId).then((list) => {
-      if (alive) setChats(list);
-    });
+    let timer: number | null = null;
+    let attempt = 0;
+    // Плохой интернет не должен оставлять пустой список навсегда:
+    // повторяем запрос с нарастающей паузой, сохраняя уже загруженное.
+    const load = () => {
+      db.getUserChats(userId)
+        .then((list) => {
+          if (!alive) return;
+          attempt = 0;
+          setChats(list);
+        })
+        .catch(() => {
+          if (!alive) return;
+          attempt += 1;
+          timer = window.setTimeout(load, Math.min(15000, 1000 * attempt));
+        });
+    };
+    void load();
     return () => {
       alive = false;
+      if (timer !== null) window.clearTimeout(timer);
     };
   }, [userId, rev]);
 
@@ -189,11 +220,25 @@ export function useMessages(chatId: string | null): Message[] {
       return;
     }
     let alive = true;
-    db.getMessages(chatId).then((list) => {
-      if (alive) setMessages(list);
-    });
+    let timer: number | null = null;
+    let attempt = 0;
+    const load = () => {
+      db.getMessages(chatId)
+        .then((list) => {
+          if (!alive) return;
+          attempt = 0;
+          setMessages(list);
+        })
+        .catch(() => {
+          if (!alive) return;
+          attempt += 1;
+          timer = window.setTimeout(load, Math.min(15000, 1000 * attempt));
+        });
+    };
+    void load();
     return () => {
       alive = false;
+      if (timer !== null) window.clearTimeout(timer);
     };
   }, [chatId, rev]);
 
@@ -249,27 +294,47 @@ export interface ChatState {
   chat: Chat | null;
   /** данные прочитаны (null при loaded=true означает «чат не найден») */
   loaded: boolean;
+  /** сеть недоступна после нескольких попыток — показываем сообщение, а не «Загрузка…» */
+  error: string | null;
 }
 
 export function useChat(chatId: string | null): ChatState {
   const rev = useDataRevision();
-  const [state, setState] = useState<ChatState>({ chat: null, loaded: false });
+  const [state, setState] = useState<ChatState>({ chat: null, loaded: false, error: null });
 
   // Показываем «Загрузка…» ТОЛЬКО при смене самого чата (первичное открытие),
   // а не при каждом обновлении ревизии (отправка/получение сообщения),
   // чтобы не мигал экран «Загрузка…» во время переписки.
   useEffect(() => {
     if (!chatId) {
-      setState({ chat: null, loaded: true });
+      setState({ chat: null, loaded: true, error: null });
       return;
     }
     let alive = true;
-    setState((prev) => (prev.chat?.id === chatId ? prev : { chat: null, loaded: false }));
-    db.getChatById(chatId).then((c) => {
-      if (alive) setState({ chat: c, loaded: true });
-    });
+    let timer: number | null = null;
+    let attempt = 0;
+    setState((prev) =>
+      prev.chat?.id === chatId ? prev : { chat: null, loaded: false, error: null },
+    );
+    const load = () => {
+      db.getChatById(chatId)
+        .then((c) => {
+          if (alive) setState({ chat: c, loaded: true, error: null });
+        })
+        .catch(() => {
+          if (!alive) return;
+          attempt += 1;
+          if (attempt >= 5) {
+            setState({ chat: null, loaded: true, error: 'Не удалось загрузить чат' });
+            return;
+          }
+          timer = window.setTimeout(load, Math.min(8000, 800 * attempt));
+        });
+    };
+    void load();
     return () => {
       alive = false;
+      if (timer !== null) window.clearTimeout(timer);
     };
   }, [chatId, rev]);
   return state;
@@ -290,9 +355,13 @@ export function usePeer(chat: Chat | null, myId: string | null): User | null {
       return;
     }
     let alive = true;
-    db.getUserById(peerId).then((u) => {
-      if (alive) setPeer(u);
-    });
+    db.getUserById(peerId)
+      .then((u) => {
+        if (alive) setPeer(u);
+      })
+      .catch(() => {
+        /* сеть недоступна: останется прежний профиль, чат не зависнет */
+      });
     return () => {
       alive = false;
     };
@@ -362,7 +431,7 @@ export function useOnline(userId: string | null): boolean {
       return;
     }
     const check = () => {
-      void db.isUserOnline(userId).then(setOnline);
+      void db.isUserOnline(userId).then(setOnline).catch(() => setOnline(false));
     };
     check();
     const interval = setInterval(check, 8000);
