@@ -18,6 +18,7 @@ export const KEYS = {
 } as const;
 
 export const CURRENT_USER_KEY = 'svyaz.currentUserId';
+export const SESSION_TOKEN_KEY = 'svyaz.sessionToken';
 
 function readString(key: string): string | null {
   try {
@@ -86,6 +87,20 @@ export function setCurrentUserId(id: string | null): void {
   try {
     if (id === null) window.localStorage.removeItem(CURRENT_USER_KEY);
     else window.localStorage.setItem(CURRENT_USER_KEY, id);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Сессионный токен: подписанный сервером секрет вместо доверия x-user-id. */
+export function getSessionToken(): string | null {
+  return readString(SESSION_TOKEN_KEY);
+}
+
+export function setSessionToken(token: string | null): void {
+  try {
+    if (token) window.localStorage.setItem(SESSION_TOKEN_KEY, token);
+    else window.localStorage.removeItem(SESSION_TOKEN_KEY);
   } catch {
     /* ignore */
   }

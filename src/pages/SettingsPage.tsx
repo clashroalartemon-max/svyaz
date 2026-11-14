@@ -15,8 +15,16 @@ import {
 } from 'lucide-react';
 import * as db from '../lib/db';
 import { emit } from '../lib/bus';
-import { getCryptoBackend } from '../lib/crypto';
+import { getCryptoBackend, getPrivateKey, savePrivateKey } from '../lib/crypto';
 import type { KeyPairStatus } from '../lib/crypto';
+import { isSoundEnabled, playNotificationSound, setSoundEnabled } from '../lib/sound';
+import {
+  notificationMode,
+  requestNotifications,
+} from '../lib/notifications';
+import type { NotificationMode } from '../lib/notifications';
+import { validatePasswordChange } from '../lib/validation';
+import { isIncognito, setIncognito } from '../lib/incognito';
 import { useCurrentUser, useTheme } from '../hooks';
 import { Avatar, Button, Input } from '../ui';
 import type { ThemeMode } from '../types';
@@ -43,6 +51,36 @@ export function SettingsPage() {
   const navigate = useNavigate();
   const me = useCurrentUser();
   const [themeMode, setThemeMode] = useTheme();
+  const [soundOn, setSoundOn] = useState(isSoundEnabled);
+  const [notifMode, setNotifMode] = useState<NotificationMode>(() => notificationMode());
+  const [incognito, setIncognitoState] = useState(isIncognito);
+  const [status, setStatus] = useState(me?.status ?? '');
+  const [lastSeenVisible, setLastSeenVisible] = useState(true);
+  const [bio, setBio] = useState(me?.bio ?? '');
+  const [profileBusy, setProfileBusy] = useState(false);
+  const [profileNotice, setProfileNotice] = useState<string | null>(null);
+  const [profileError, setProfileError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setStatus(me?.status ?? '');
+    setBio(me?.bio ?? '');
+  }, [me?.id, me?.status, me?.bio]);
+
+  const saveProfile = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!myId) return;
+    setProfileBusy(true);
+    setProfileError(null);
+    setProfileNotice(null);
+    try {
+      await db.updateMyProfile({ status, bio });
+      setProfileNotice('Статус и «О себе» сохранены');
+    } catch (error) {
+      setProfileError(error instanceof Error ? error.message : 'Не удалось сохранить профиль');
+    } finally {
+      setProfileBusy(false);
+    }
+  };
 
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -67,6 +105,79 @@ export function SettingsPage() {
   const [usernameNotice, setUsernameNotice] = useState<string | null>(null);
 
   const myId = me?.id ?? null;
+
+  useEffect(() => {
+    if (!myId) return;
+    void db.getPresence(myId).then((presence) => {
+      if (presence) setLastSeenVisible(presence.showLastSeen);
+    });
+  }, [myId]);
+
+  const saveLastSeen = async (visible: boolean) => {
+    if (!myId) return;
+    setLastSeenVisible(visible);
+    const ok = await db.setLastSeenVisible(myId, visible);
+    if (!ok) setProfileNotice('Не удалось сохранить: примените supabase/last_seen.sql');
+  };
+
+  const exportKey = () => {
+    if (!myId) return;
+    const jwk = getPrivateKey(myId);
+    if (!jwk) {
+      setProfileNotice('На этом устройстве нет приватного ключа');
+      return;
+    }
+    const payload = JSON.stringify({ userId: myId, login: me?.login, jwk }, null, 2);
+    const url = URL.createObjectURL(new Blob([payload], { type: 'application/json' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `svyaz-key-${me?.login ?? myId}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    setProfileNotice('Ключ сохранён в файл. Перенесите его на телефон и импортируйте.');
+  };
+
+  const importKey = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file || !myId) return;
+    try {
+      const parsed = JSON.parse(await file.text()) as { userId?: string; jwk?: JsonWebKey };
+      if (parsed.userId && parsed.userId !== myId) {
+        setProfileNotice('Это ключ другого пользователя');
+        return;
+      }
+      if (!parsed.jwk || parsed.jwk.kty !== 'EC' || !parsed.jwk.d) {
+        setProfileNotice('Файл не похож на ключ Связи');
+        return;
+      }
+      savePrivateKey(myId, parsed.jwk);
+      setProfileNotice('Ключ импортирован. Перезагружаю сообщения…');
+      window.setTimeout(() => window.location.reload(), 700);
+    } catch {
+      setProfileNotice('Не удалось прочитать файл ключа');
+    }
+  };
+
+  const resetCache = async () => {
+    try {
+      if ('caches' in window) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map((key) => caches.delete(key)));
+      }
+    } catch {
+      /* кэш недоступен */
+    }
+    try {
+      if ('serviceWorker' in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map((reg) => reg.unregister()));
+      }
+    } catch {
+      /* service worker недоступен */
+    }
+    window.location.replace(`/main?v=${Date.now()}`);
+  };
 
   useEffect(() => {
     if (!myId) return;
@@ -148,12 +259,14 @@ export function SettingsPage() {
     e.preventDefault();
     setPasswordError(null);
     setPasswordNotice(null);
-    if (newPassword.length < 6) {
-      setPasswordError('Новый пароль короче 6 символов');
-      return;
-    }
-    if (newPassword !== repeatPassword) {
-      setPasswordError('Пароли не совпадают');
+    const check = validatePasswordChange(
+      currentPassword,
+      newPassword,
+      repeatPassword,
+      me?.login,
+    );
+    if (!check.ok) {
+      setPasswordError(check.error);
       return;
     }
     setPasswordBusy(true);
@@ -252,6 +365,37 @@ export function SettingsPage() {
         </div>
 
         <Section
+          title="Статус и о себе"
+          hint="Короткий статус виден в списке чатов и в профиле"
+        >
+          <form onSubmit={(e) => void saveProfile(e)} className="flex flex-col gap-3">
+            <Input
+              label="Статус"
+              value={status}
+              onChange={(e) => setStatus(e.target.value)}
+              placeholder="На учёбе, в наряде, свободен…"
+              maxLength={40}
+            />
+            <label className="flex flex-col gap-1 text-[13px] text-text-muted">
+              О себе
+              <textarea
+                value={bio}
+                onChange={(e) => setBio(e.target.value)}
+                maxLength={200}
+                rows={3}
+                placeholder="Пара слов о себе"
+                className="resize-none rounded-lg border border-border bg-bg px-3 py-2 text-[15px] text-text placeholder:text-text-muted focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+              />
+            </label>
+            {profileError && <p className="text-[13px] text-danger">{profileError}</p>}
+            {profileNotice && <p className="text-[13px] text-text-muted">{profileNotice}</p>}
+            <Button type="submit" disabled={profileBusy} className="w-full">
+              {profileBusy ? 'Сохранение…' : 'Сохранить статус'}
+            </Button>
+          </form>
+        </Section>
+
+        <Section
           title="Ник (username)"
           hint="Уникальный ник для поиска по точному совпадению. Можно менять в любой момент."
         >
@@ -269,6 +413,38 @@ export function SettingsPage() {
               {usernameBusy ? 'Сохранение…' : 'Сохранить ник'}
             </Button>
           </form>
+        </Section>
+
+        <Section
+          title="Ключ шифрования"
+          hint="Сообщения читаются только ключом этого аккаунта. На новом телефоне импортируйте файл ключа, сохранённый на компьютере."
+        >
+          <div className="flex flex-wrap gap-2">
+            <Button type="button" onClick={exportKey} className="flex items-center gap-2">
+              <Download size={16} />
+              Сохранить ключ
+            </Button>
+            <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-border px-3 py-2 text-[14px] text-text hover:bg-surface">
+              <Upload size={16} />
+              Импортировать ключ
+              <input type="file" accept="application/json,.json" onChange={(e) => void importKey(e)} className="hidden" />
+            </label>
+          </div>
+        </Section>
+
+        <Section
+          title="Приватность"
+          hint="Время последнего визита видят другие, только если вы разрешили. Чужое время вы видите, если собеседник его показывает."
+        >
+          <label className="flex items-center justify-between gap-3 text-[14px] text-text">
+            Показывать время последнего визита
+            <input
+              type="checkbox"
+              checked={lastSeenVisible}
+              onChange={(e) => void saveLastSeen(e.target.checked)}
+              className="h-5 w-5 accent-[var(--accent)]"
+            />
+          </label>
         </Section>
 
         <Section title="Тема оформления" hint="Как в системе — автоматически за ОС">
@@ -293,6 +469,95 @@ export function SettingsPage() {
               );
             })}
           </div>
+        </Section>
+
+        <Section title="Звук уведомлений" hint="Короткий сигнал при новом сообщении">
+          <button
+            type="button"
+            onClick={() => {
+              const next = !soundOn;
+              setSoundOn(next);
+              setSoundEnabled(next);
+              if (next) playNotificationSound();
+            }}
+            aria-pressed={soundOn}
+            className="flex w-full items-center justify-between gap-3 rounded-lg border border-border px-3 py-2.5 text-left hover:bg-surface"
+          >
+            <span className="text-[15px] text-text">
+              {soundOn ? 'Звук включён' : 'Звук выключен'}
+            </span>
+            <span
+              className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${
+                soundOn ? 'bg-accent' : 'bg-border'
+              }`}
+            >
+              <span
+                className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform ${
+                  soundOn ? 'translate-x-5' : 'translate-x-0.5'
+                }`}
+              />
+            </span>
+          </button>
+        </Section>
+
+        <Section
+          title="Уведомления в браузере"
+          hint="Всплывающее окно, если чат не открыт. Работает на localhost/https"
+        >
+          <button
+            type="button"
+            disabled={notifMode === 'unsupported' || notifMode === 'denied'}
+            onClick={() => {
+              void requestNotifications().then(setNotifMode);
+            }}
+            className="flex w-full items-center justify-between gap-3 rounded-lg border border-border px-3 py-2.5 text-left hover:bg-surface disabled:opacity-60"
+          >
+            <span className="text-[15px] text-text">
+              {notifMode === 'granted'
+                ? 'Уведомления включены'
+                : notifMode === 'denied'
+                  ? 'Запрещены в настройках браузера'
+                  : notifMode === 'unsupported'
+                    ? 'Браузер не поддерживает'
+                    : 'Включить уведомления'}
+            </span>
+            <span
+              className={`h-2.5 w-2.5 rounded-full ${
+                notifMode === 'granted' ? 'bg-green-500' : 'bg-border'
+              }`}
+            />
+          </button>
+        </Section>
+
+        <Section
+          title="Режим инкогнито"
+          hint="Скрывает текст последнего сообщения в списке чатов"
+        >
+          <button
+            type="button"
+            onClick={() => {
+              const next = !incognito;
+              setIncognitoState(next);
+              setIncognito(next);
+            }}
+            aria-pressed={incognito}
+            className="flex w-full items-center justify-between gap-3 rounded-lg border border-border px-3 py-2.5 text-left hover:bg-surface"
+          >
+            <span className="text-[15px] text-text">
+              {incognito ? 'Инкогнито включён' : 'Инкогнито выключен'}
+            </span>
+            <span
+              className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${
+                incognito ? 'bg-accent' : 'bg-border'
+              }`}
+            >
+              <span
+                className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform ${
+                  incognito ? 'translate-x-5' : 'translate-x-0.5'
+                }`}
+              />
+            </span>
+          </button>
         </Section>
 
         <Section title="Смена пароля" hint="Пароль хранится как SHA-256-хэш">
@@ -399,6 +664,15 @@ export function SettingsPage() {
               </Button>
             )}
           </div>
+        </Section>
+
+        <Section
+          title="О приложении"
+          hint={`Сборка: ${__BUILD_ID__}. Если на телефоне открылась старая версия — сбросьте кэш.`}
+        >
+          <Button variant="secondary" className="w-full" onClick={() => void resetCache()}>
+            Сбросить кэш и обновить
+          </Button>
         </Section>
 
         {me.role === 'admin' && (

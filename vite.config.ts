@@ -3,6 +3,11 @@ import react from '@vitejs/plugin-react';
 
 // https://vitejs.dev/config/
 export default defineConfig({
+  define: {
+    // Метка сборки видна в «Настройках»: по ней легко понять, какая версия
+    // открыта на телефоне и не осталась ли там старая копия в кэше.
+    __BUILD_ID__: JSON.stringify(new Date().toISOString()),
+  },
   plugins: [react()],
   build: {
     // Разделяем вендоров: стартовый чанк остаётся компактным, а браузер
@@ -39,5 +44,10 @@ export default defineConfig({
     port: 4173,
     strictPort: true,
     allowedHosts: true,
+    // Телефон мог держать старую сборку в кэше: index.html не кэшируем,
+    // чтобы после обновления всегда открывалась актуальная версия.
+    headers: {
+      'Cache-Control': 'no-store',
+    },
   },
 });

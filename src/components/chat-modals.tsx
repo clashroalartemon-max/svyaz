@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+﻿import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import {
   ArchiveRestore,
@@ -7,7 +7,10 @@ import {
   CircleDot,
   CornerUpLeft,
   Download,
+  Flag,
+  Forward,
   Pencil,
+  Pin,
   Search,
   Square,
   Star,
@@ -19,6 +22,7 @@ import type { Message } from '../types';
 import * as db from '../lib/db';
 import type { User } from '../types';
 import { Avatar } from '../ui';
+import { REACTION_EMOJIS } from '../lib/reactions';
 
 /** Общая рамка модального окна */
 export function ModalOverlay({
@@ -30,10 +34,23 @@ export function ModalOverlay({
   onClose: (() => void) | null;
   wide?: boolean;
 }) {
+  // Esc закрывает любую модалку (если закрытие разрешено).
+  useEffect(() => {
+    if (!onClose) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
       <div
-        className={`relative max-h-full w-full overflow-y-auto rounded-lg border border-border bg-bg p-4 ${
+        className={`modal-in relative max-h-full w-full overflow-y-auto rounded-lg border border-border bg-bg p-4 ${
           wide ? 'max-w-lg' : 'max-w-md'
         }`}
       >
@@ -382,25 +399,39 @@ export function CircleCaptureModal({
 
 // --- меню действий над сообщением --------------------------------------------------
 
+const QUICK_REPLIES = ['Ок', 'Принято', 'Скоро буду'] as const;
+
 export function MessageActionsMenu({
   msg,
   own,
   canDeleteAll,
   onReply,
+  onQuickReply,
+  onForward,
+  onPin,
+  onReact,
+  pinned,
   onEdit,
   onDelete,
   onDeleteForAll,
   onSave,
+  onReport,
   onClose,
 }: {
   msg: Message;
   own: boolean;
   canDeleteAll: boolean;
   onReply: () => void;
+  onQuickReply: (text: string) => void;
+  onForward: () => void;
+  onPin: () => void;
+  onReact: (emoji: string) => void;
+  pinned: boolean;
   onEdit: () => void;
   onDelete: () => void;
   onDeleteForAll: (() => void) | null;
   onSave: () => void;
+  onReport: () => void;
   onClose: () => void;
 }) {
   const canEdit = own && msg.type === 'text' && !msg.deleted;
@@ -416,14 +447,65 @@ export function MessageActionsMenu({
           {own ? 'Ваше сообщение' : 'Сообщение'}
         </div>
         {!msg.deleted && (
+          <div className="flex flex-wrap items-center justify-between gap-1 border-b border-border px-3 py-2">
+            {REACTION_EMOJIS.map((emoji) => (
+              <button
+                key={emoji}
+                type="button"
+                onClick={() => onReact(emoji)}
+                className="rounded-full px-1.5 py-0.5 text-[20px] hover:bg-surface"
+                aria-label={`Реакция ${emoji}`}
+              >
+                {emoji}
+              </button>
+            ))}
+          </div>
+        )}
+        {!msg.deleted && (
+          <div className="flex flex-wrap gap-1.5 border-b border-border px-3 py-2">
+            {QUICK_REPLIES.map((text) => (
+              <button
+                key={text}
+                type="button"
+                onClick={() => onQuickReply(text)}
+                className="rounded-full border border-border px-3 py-1 text-[13px] text-text hover:border-accent hover:text-accent"
+              >
+                {text}
+              </button>
+            ))}
+          </div>
+        )}
+        {!msg.deleted && (
           <ActionButton
             icon={<CornerUpLeft size={16} />}
             label="Ответить"
             onClick={onReply}
           />
         )}
+        {!msg.deleted && (
+          <ActionButton
+            icon={<Pin size={16} />}
+            label={pinned ? 'Открепить' : 'Закрепить'}
+            onClick={onPin}
+          />
+        )}
         {canSave && (
           <ActionButton icon={<Star size={16} />} label="В избранное" onClick={onSave} />
+        )}
+        {!msg.deleted && (
+          <ActionButton
+            icon={<Forward size={16} />}
+            label="Переслать"
+            onClick={onForward}
+          />
+        )}
+        {!own && !msg.deleted && (
+          <ActionButton
+            icon={<Flag size={16} />}
+            label="Пожаловаться"
+            onClick={onReport}
+            danger
+          />
         )}
         {canEdit && (
           <ActionButton icon={<Pencil size={16} />} label="Редактировать" onClick={onEdit} />

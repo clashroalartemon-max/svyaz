@@ -32,6 +32,13 @@ export interface ChatBroadcast {
   chatId: string;
 }
 
+export interface MentionBroadcast {
+  chatId: string;
+  from: string;
+  userIds: string[];
+  text: string;
+}
+
 /**
  * Открыть подписку. Повторный вызов безопасен.
  *
@@ -67,6 +74,9 @@ export function startRealtime(): void {
         const data = payload as ChatBroadcast | undefined;
         // Новый чат создан на другом устройстве — перечитываем список.
         emit('chat:updated', data?.chatId ? { chatId: data.chatId } : {});
+      })
+      .on('broadcast', { event: 'mention' }, ({ payload }) => {
+        emit('mention:new', payload as MentionBroadcast);
       })
       .subscribe();
     running = true;
@@ -104,6 +114,16 @@ export async function broadcastChat(chatId: string): Promise<void> {
     await channel.send({ type: 'broadcast', event: 'chat', payload });
   } catch {
     /* не критично: чат появится при следующем обновлении списка */
+  }
+}
+
+/** Уведомить упомянутых пользователей (broadcast, без записи в базу). */
+export async function broadcastMention(payload: MentionBroadcast): Promise<void> {
+  if (!channel) return;
+  try {
+    await channel.send({ type: 'broadcast', event: 'mention', payload });
+  } catch {
+    /* не критично */
   }
 }
 

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { FormEvent } from 'react';
 import { Navigate } from 'react-router-dom';
 import * as db from '../lib/db';
+import { validateLogin } from '../lib/validation';
 import { useAuth } from '../hooks';
 import { Button, Input } from '../ui';
 
@@ -16,8 +17,13 @@ export function LoginPage() {
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!login.trim() || !password) {
-      setError('Введите логин и пароль');
+    const loginCheck = validateLogin(login);
+    if (!loginCheck.ok) {
+      setError(loginCheck.error);
+      return;
+    }
+    if (!password) {
+      setError('Введите пароль');
       return;
     }
     setPending(true);

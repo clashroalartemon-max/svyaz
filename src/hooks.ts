@@ -44,12 +44,16 @@ export function useCurrentUser(): User | null {
     };
     void fetch();
     // Свежее ФИО/аватар/группа после их изменения на любом устройстве.
-    const unsub = on('avatar:updated', () => {
+    const unsubAvatar = on('avatar:updated', () => {
+      void fetch();
+    });
+    const unsubProfile = on('profile:updated', () => {
       void fetch();
     });
     return () => {
       alive = false;
-      unsub();
+      unsubAvatar();
+      unsubProfile();
       if (timer !== null) window.clearTimeout(timer);
     };
   }, [userId]);
@@ -118,6 +122,7 @@ export function useDataRevision(): number {
 
   useEffect(() => {
     let disposed = false;
+    let timer: number | null = null;
     const refresh = () => {
       if (disposed) return;
       const next = storage.getRev();
@@ -126,11 +131,21 @@ export function useDataRevision(): number {
         setRev(next);
       }
     };
+    // События могут идти пачкой (нагрузка, массовая отправка): обновляем
+    // данные не чаще ~4 раз в секунду, иначе список и лента перечитываются
+    // на каждое сообщение.
+    const schedule = () => {
+      if (disposed || timer !== null) return;
+      timer = window.setTimeout(() => {
+        timer = null;
+        refresh();
+      }, 250);
+    };
     const unsubs = [
-      on('chat:updated', refresh),
-      on('message:new', refresh),
-      on('message:updated', refresh),
-      on('chat:cleared', refresh),
+      on('chat:updated', schedule),
+      on('message:new', schedule),
+      on('message:updated', schedule),
+      on('chat:cleared', schedule),
     ];
     // Фоллбэк, если Realtime-событие потерялось (вкладка была в фоне, websocket
     // переподключался): при возврате на вкладку перечитываем данные.
@@ -145,6 +160,7 @@ export function useDataRevision(): number {
     // (src/lib/realtime.ts) и через шину событий.
     return () => {
       disposed = true;
+      if (timer !== null) window.clearTimeout(timer);
       for (const unsub of unsubs) unsub();
       window.removeEventListener('focus', wake);
       document.removeEventListener('visibilitychange', wake);
@@ -156,13 +172,22 @@ export function useDataRevision(): number {
 
 // --- данные --------------------------------------------------------------------
 
-export function useChats(userId: string | null): ChatListItem[] {
+export interface ChatsState {
+  chats: ChatListItem[];
+  loading: boolean;
+  error: boolean;
+}
+
+export function useChats(userId: string | null): ChatsState {
   const rev = useDataRevision();
   const [chats, setChats] = useState<ChatListItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
 
   useEffect(() => {
     if (!userId) {
       setChats([]);
+      setLoading(false);
       return;
     }
     let alive = true;
@@ -176,10 +201,17 @@ export function useChats(userId: string | null): ChatListItem[] {
           if (!alive) return;
           attempt = 0;
           setChats(list);
+          setLoading(false);
+          setError(false);
         })
         .catch(() => {
           if (!alive) return;
           attempt += 1;
+          if (attempt >= 3) {
+            setLoading(false);
+            setError(true);
+            return;
+          }
           timer = window.setTimeout(load, Math.min(15000, 1000 * attempt));
         });
     };
@@ -190,7 +222,7 @@ export function useChats(userId: string | null): ChatListItem[] {
     };
   }, [userId, rev]);
 
-  return chats;
+  return { chats, loading, error };
 }
 
 /** Совпадают ли списки по значимым для UI полям (id, статус, правка, удаление) */
@@ -222,12 +254,20 @@ export function useMessages(chatId: string | null): Message[] {
     let alive = true;
     let timer: number | null = null;
     let attempt = 0;
+    const withQueued = (list: Message[]): Message[] => {
+      const queued = db.getQueuedMessages(chatId);
+      if (queued.length === 0) return list;
+      const ids = new Set(list.map((m) => m.id));
+      return [...list, ...queued.filter((m) => !ids.has(m.id))].sort(
+        (a, b) => a.createdAt - b.createdAt,
+      );
+    };
     const load = () => {
       db.getMessages(chatId)
         .then((list) => {
           if (!alive) return;
           attempt = 0;
-          setMessages(list);
+          setMessages(withQueued(list));
         })
         .catch(() => {
           if (!alive) return;

@@ -6,6 +6,7 @@ import {
   BarChart3,
   Building2,
   Download,
+  Flag,
   KeyRound,
   LogOut,
   Megaphone,
@@ -33,6 +34,7 @@ type AdminTab =
   | 'users'
   | 'chats'
   | 'broadcasts'
+  | 'complaints'
   | 'audit'
   | 'structure'
   | 'settings';
@@ -42,6 +44,7 @@ const TABS: Array<{ key: AdminTab; label: string; icon: typeof Users }> = [
   { key: 'users', label: 'Пользователи', icon: Users },
   { key: 'chats', label: 'Чаты', icon: MessagesSquare },
   { key: 'broadcasts', label: 'Оповещения', icon: Megaphone },
+  { key: 'complaints', label: 'Жалобы', icon: Flag },
   { key: 'audit', label: 'Журнал', icon: ScrollText },
   { key: 'structure', label: 'Структура', icon: Building2 },
   { key: 'settings', label: 'Настройки', icon: Settings },
@@ -78,6 +81,22 @@ export function AdminPage() {
   if (!myId || !me) return null;
   if (!roleAdmin) return <Navigate to="/main" replace />;
 
+  const downloadBackup = async () => {
+    try {
+      const data = await db.exportBackup();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `svyaz-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 5000);
+      setNotice('Резервная копия скачана');
+    } catch (error) {
+      setError(error instanceof Error ? error.message : 'Не удалось создать резервную копию');
+    }
+  };
+
   return (
     <div className="flex h-full flex-col bg-bg">
       <header className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-3">
@@ -93,7 +112,16 @@ export function AdminPage() {
           <Shield size={18} className="text-accent" />
           Админ-панель
         </h1>
-        <span className="ml-auto rounded-md border border-accent/40 bg-accent/10 px-2 py-0.5 text-[13px] text-accent">
+        <button
+          type="button"
+          onClick={() => void downloadBackup()}
+          className="ml-auto rounded-lg p-2 text-text-muted hover:bg-surface hover:text-text"
+          aria-label="Скачать резервную копию"
+          title="Резервная копия (JSON)"
+        >
+          <Download size={18} />
+        </button>
+        <span className="rounded-md border border-accent/40 bg-accent/10 px-2 py-0.5 text-[13px] text-accent">
           {users.length} пользователей
         </span>
       </header>
@@ -148,6 +176,7 @@ export function AdminPage() {
         )}
         {tab === 'chats' && <ChatsTab users={users} setNotice={setNotice} setError={setError} />}
         {tab === 'broadcasts' && <BroadcastsTab setNotice={setNotice} setError={setError} />}
+        {tab === 'complaints' && <ComplaintsTab />}
         {tab === 'audit' && <AuditTab />}
         {tab === 'structure' && <StructureTab setNotice={setNotice} setError={setError} />}
         {tab === 'settings' && (
@@ -168,6 +197,8 @@ export function AdminPage() {
 function DashboardTab() {
   const [stats, setStats] = useState<db.AdminStats | null>(null);
   const [loading, setLoading] = useState(true);
+  const [activity, setActivity] = useState<db.AdminActivityPoint[]>([]);
+  const [activityMissing, setActivityMissing] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -177,6 +208,20 @@ function DashboardTab() {
       })
       .catch(() => {})
       .finally(() => alive && setLoading(false));
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    db.getAdminActivity(30)
+      .then((points) => {
+        if (alive) setActivity(points);
+      })
+      .catch(() => {
+        if (alive) setActivityMissing(true);
+      });
     return () => {
       alive = false;
     };
@@ -216,6 +261,100 @@ function DashboardTab() {
           ))}
         </div>
       </div>
+
+      <MonthChart points={activity} missing={activityMissing} />
+    </div>
+  );
+}
+
+/** Активность за 30 дней: SVG-график с областью и подписями дат. */
+function MonthChart({
+  points,
+  missing,
+}: {
+  points: db.AdminActivityPoint[];
+  missing: boolean;
+}) {
+  const total = points.reduce((sum, p) => sum + p.count, 0);
+  const max = Math.max(1, ...points.map((p) => p.count));
+  const W = 600;
+  const H = 150;
+  const padX = 8;
+  const baseY = H - 22;
+  const step = points.length > 1 ? (W - padX * 2) / (points.length - 1) : 0;
+  const coords = points.map((p, i) => ({
+    x: padX + i * step,
+    y: baseY - (p.count / max) * (H - 50),
+    ...p,
+  }));
+  const line = coords.map((c) => `${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(' ');
+  const area = coords.length
+    ? `M ${padX},${baseY} L ${coords.map((c) => `${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(' L ')} L ${(W - padX).toFixed(1)},${baseY} Z`
+    : '';
+  const labels = coords.filter((_, i) => i % 7 === 0 || i === coords.length - 1);
+
+  return (
+    <div className="rounded-lg border border-border bg-surface p-3">
+      <div className="mb-2 flex items-baseline justify-between gap-2">
+        <div className="text-[13px] font-medium text-text-muted">
+          Активность за 30 дней (сообщения)
+        </div>
+        <div className="text-[15px] font-semibold tabular-nums text-text">{total}</div>
+      </div>
+
+      {missing || points.length === 0 ? (
+        <p className="text-[12px] text-text-muted">
+          {missing
+            ? 'График появится после обновления schema.sql (функция admin_activity).'
+            : 'Пока нет данных для графика.'}
+        </p>
+      ) : (
+        <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="Активность за 30 дней">
+          <defs>
+            <linearGradient id="adminActivityFill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.35" />
+              <stop offset="100%" stopColor="var(--accent)" stopOpacity="0.02" />
+            </linearGradient>
+          </defs>
+          {[0.25, 0.5, 0.75].map((k) => (
+            <line
+              key={k}
+              x1={padX}
+              x2={W - padX}
+              y1={baseY - k * (H - 50)}
+              y2={baseY - k * (H - 50)}
+              stroke="var(--border)"
+              strokeDasharray="3 4"
+            />
+          ))}
+          <path d={area} fill="url(#adminActivityFill)" />
+          <polyline
+            points={line}
+            fill="none"
+            stroke="var(--accent)"
+            strokeWidth="2.5"
+            strokeLinejoin="round"
+            strokeLinecap="round"
+          />
+          {coords.map((c) =>
+            c.count === max && max > 0 ? (
+              <circle key={`p-${c.day}`} cx={c.x} cy={c.y} r="3.5" fill="var(--accent)" />
+            ) : null,
+          )}
+          {labels.map((c) => (
+            <text
+              key={`l-${c.day}`}
+              x={c.x}
+              y={H - 4}
+              textAnchor={c.x < 30 ? 'start' : c.x > W - 30 ? 'end' : 'middle'}
+              fontSize="10"
+              fill="var(--text-muted)"
+            >
+              {c.day}
+            </text>
+          ))}
+        </svg>
+      )}
     </div>
   );
 }
@@ -258,6 +397,7 @@ function UsersTab({
   const [groupFilter, setGroupFilter] = useState('');
   const [deptFilter, setDeptFilter] = useState('');
   const [posFilter, setPosFilter] = useState('');
+  const [rankFilter, setRankFilter] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [departments, setDepartments] = useState<string[]>([]);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -304,9 +444,13 @@ function UsersTab({
       if (groupFilter && u.group !== groupFilter) return false;
       if (deptFilter && (u.department ?? '') !== deptFilter) return false;
       if (posFilter && (u.position ?? '') !== posFilter) return false;
+      if (rankFilter) {
+        const base = (u.rank ?? '').replace(/\s+полиции\s*$/i, '').trim().toLowerCase();
+        if (base !== rankFilter) return false;
+      }
       return true;
     });
-  }, [users, query, groupFilter, deptFilter, posFilter]);
+  }, [users, query, groupFilter, deptFilter, posFilter, rankFilter]);
 
   const toggleSelect = (id: string) => {
     setSelected((prev) => {
@@ -473,7 +617,10 @@ function UsersTab({
 
   const exportCsv = () => {
     const header = ['ФИО', 'Логин', 'Группа', 'Звание', 'Должность', 'Подразделение'];
-    const rows = filtered.map((u) => [
+    // Если отмечены галочками — экспортируем ровно выбранных, иначе фильтр.
+    const exportList =
+      selected.size > 0 ? users.filter((u) => selected.has(u.id)) : filtered;
+    const rows = exportList.map((u) => [
       u.fullName,
       u.login,
       u.group,
@@ -490,7 +637,7 @@ function UsersTab({
     a.download = `users-${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     URL.revokeObjectURL(url);
-    setNotice(`Экспортировано пользователей: ${filtered.length}.`);
+    setNotice(`Экспортировано пользователей: ${exportList.length}.`);
   };
 
   const parseCsv = (text: string): db.ImportUserRow[] => {
@@ -615,6 +762,18 @@ function UsersTab({
             {positions.map((p) => (
               <option key={p} value={p}>
                 {p}
+              </option>
+            ))}
+          </select>
+          <select
+            value={rankFilter}
+            onChange={(e) => setRankFilter(e.target.value)}
+            className="w-full rounded-lg border border-border bg-surface px-2 py-1.5 text-[13px] text-text"
+          >
+            <option value="">Все звания</option>
+            {RANKS.map((r) => (
+              <option key={r} value={r}>
+                {r}
               </option>
             ))}
           </select>
@@ -976,6 +1135,7 @@ function ChatsTab({
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState('');
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [merging, setMerging] = useState(false);
 
   const nameById = useMemo(() => {
     const m = new Map<string, string>();
@@ -1039,14 +1199,47 @@ function ChatsTab({
     }
   };
 
+  const mergeDuplicates = async () => {
+    if (merging) return;
+    setMerging(true);
+    try {
+      const removed = await db.adminMergeDuplicateChats();
+      setNotice(
+        removed > 0
+          ? `Объединено дублей: ${removed}. Сообщения и участники перенесены.`
+          : 'Дублей не найдено — всё уже объединено.',
+      );
+      await load();
+    } catch (e) {
+      setError(
+        e instanceof Error
+          ? `Не удалось объединить дубли: ${e.message}`
+          : 'Не удалось объединить дубли. Выполните обновлённый schema.sql.',
+      );
+    } finally {
+      setMerging(false);
+    }
+  };
+
   return (
     <div className="space-y-3">
-      <input
-        value={query}
-        onChange={(e) => setQuery(e.target.value)}
-        placeholder="Поиск по названию, взводу или типу…"
-        className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-[15px] text-text placeholder:text-text-muted"
-      />
+      <div className="flex gap-2">
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Поиск по названию, взводу или типу…"
+          className="min-w-0 flex-1 rounded-lg border border-border bg-surface px-3 py-2 text-[15px] text-text placeholder:text-text-muted"
+        />
+        <button
+          type="button"
+          onClick={() => void mergeDuplicates()}
+          disabled={merging}
+          className="shrink-0 rounded-lg border border-border px-3 py-2 text-[13px] text-text hover:bg-surface disabled:opacity-50"
+          title="Перенести сообщения и участников из дублей авточатов в один чат"
+        >
+          {merging ? 'Объединяем…' : 'Объединить дубли'}
+        </button>
+      </div>
       <div className="text-[13px] text-text-muted">Всего чатов: {filtered.length}</div>
 
       {loading && <p className="text-[13px] text-text-muted">Загрузка…</p>}
@@ -1164,7 +1357,6 @@ function BroadcastsTab({
     new Date(ts).toLocaleString('ru-RU', {
       day: '2-digit',
       month: '2-digit',
-      year: 'numeric',
       hour: '2-digit',
       minute: '2-digit',
     });
@@ -1209,6 +1401,58 @@ function BroadcastsTab({
 
 // ---------------------------------------------------------------- Журнал
 
+function ComplaintsTab() {
+  const [items, setItems] = useState<db.AuditEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    db.getAuditLog({ action: 'Жалоба', limit: 200 })
+      .then((rows) => {
+        if (alive) setItems(rows);
+      })
+      .catch((e) => {
+        if (alive) setError(e instanceof Error ? e.message : 'Не удалось загрузить жалобы');
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  return (
+    <div className="space-y-3">
+      <div className="text-[13px] text-text-muted">
+        Жалобы поступают из меню сообщения («Пожаловаться»). Всего: {items.length}
+      </div>
+      {error && <div className="rounded-lg border border-danger/40 bg-danger/10 p-3 text-[13px] text-danger">{error}</div>}
+      {loading && <div className="text-[13px] text-text-muted">Загрузка…</div>}
+      {!loading && items.length === 0 && (
+        <p className="py-6 text-center text-[13px] text-text-muted">Жалоб пока нет</p>
+      )}
+      {items.map((item) => (
+        <div key={item.id} className="rounded-lg border border-border p-3">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[14px] font-medium text-text">
+              {item.actorName ?? 'Пользователь'}
+            </span>
+            <span className="text-[12px] text-text-muted">
+              {new Date(item.createdAt).toLocaleString('ru-RU')}
+            </span>
+          </div>
+          <div className="mt-1 text-[13px] text-text">{item.action}</div>
+          <div className="mt-0.5 text-[12px] text-text-muted">
+            Сообщение: {item.targetId ?? '—'} · {item.details ?? ''}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function AuditTab() {
   const [items, setItems] = useState<db.AuditEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1237,19 +1481,52 @@ function AuditTab() {
 
   useEffect(() => {
     void load();
+    // Перезагружаем при смене дат (в т.ч. быстрыми кнопками), фильтры
+    // по пользователю и действию применяются кнопкой.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [dateFrom, dateTo]);
 
   const fmt = (ts: number) =>
     new Date(ts).toLocaleString('ru-RU', {
       day: '2-digit',
       month: '2-digit',
+      year: 'numeric',
       hour: '2-digit',
       minute: '2-digit',
     });
 
+  const ymd = (d: Date) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const setRange = (fromOffset: number, toOffset: number) => {
+    const now = new Date();
+    const from = new Date(now);
+    from.setDate(now.getDate() + fromOffset);
+    const to = new Date(now);
+    to.setDate(now.getDate() + toOffset);
+    setDateFrom(ymd(from));
+    setDateTo(ymd(to));
+  };
+  const RANGES = [
+    { label: 'Сегодня', from: 0, to: 0 },
+    { label: 'Вчера', from: -1, to: -1 },
+    { label: '7 дней', from: -6, to: 0 },
+    { label: '30 дней', from: -29, to: 0 },
+  ] as const;
+
   return (
     <div className="space-y-3">
+      <div className="flex flex-wrap gap-1.5">
+        {RANGES.map((r) => (
+          <button
+            key={r.label}
+            type="button"
+            onClick={() => setRange(r.from, r.to)}
+            className="rounded-lg border border-border px-2.5 py-1 text-[12px] text-text hover:bg-surface"
+          >
+            {r.label}
+          </button>
+        ))}
+      </div>
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
         <input
           value={actor}
@@ -1497,6 +1774,13 @@ function SettingsTab({
         checked={settings.chatsDisabled}
         disabled={saving}
         onChange={(v) => void update('chats_disabled', String(v))}
+      />
+      <ToggleRow
+        title="Технический режим"
+        description="Диагностические подписи (ID чатов и сообщений) для администратора."
+        checked={settings.techMode}
+        disabled={saving}
+        onChange={(v) => void update('tech_mode', String(v))}
       />
       <div className="rounded-lg border border-border bg-surface p-3">
         <div className="mb-1 text-[14px] font-medium text-text">Главный администратор</div>

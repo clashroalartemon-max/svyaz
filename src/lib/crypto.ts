@@ -183,6 +183,15 @@ export function savePrivateKey(userId: string, jwk: JsonWebKey): void {
   window.localStorage.setItem(keyStorageName(userId), JSON.stringify(jwk));
 }
 
+/** Удалить приватный ключ пользователя с устройства (выход из аккаунта). */
+export function clearPrivateKey(userId: string): void {
+  try {
+    window.localStorage.removeItem(keyStorageName(userId));
+  } catch {
+    /* приватный ключ и так недоступен */
+  }
+}
+
 // --- переносимость ключа: шифрование приватного ключа паролем ------------------
 
 /** SHA-256 в байтах (32) — для вывода ключа шифрования из пароля */

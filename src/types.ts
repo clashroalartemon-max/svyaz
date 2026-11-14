@@ -73,15 +73,19 @@ export interface User {
   department?: string;
   /** контактный телефон */
   phone?: string;
+  /** короткий статус: «На учёбе», «В наряде», «Свободен» */
+  status?: string;
+  /** краткое био «О себе» */
+  bio?: string;
   publicKeyJwk: JsonWebKey;
   avatarUrl?: string;
   createdAt: number;
 }
 
-export type MessageType = 'text' | 'voice' | 'photo' | 'video' | 'circle';
+export type MessageType = 'text' | 'voice' | 'photo' | 'video' | 'circle' | 'document';
 
 /** Статус доставки собственного сообщения */
-export type MessageStatus = 'sent' | 'delivered' | 'read';
+export type MessageStatus = 'queued' | 'sent' | 'delivered' | 'read';
 
 /**
  * Поля «конверта»: контент зашифрован случайным AES-ключом,

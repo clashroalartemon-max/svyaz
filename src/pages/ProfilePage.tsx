@@ -1,20 +1,25 @@
-import { useEffect, useMemo, useState } from 'react';
+﻿import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import {
   ArrowLeft,
+  ChevronLeft,
+  ChevronRight,
   Download,
   Image as ImageIcon,
   Link2,
   Mic,
+  Pencil,
   PlayCircle,
   Star,
   X,
 } from 'lucide-react';
 import * as db from '../lib/db';
 import { decryptGroupEnvelope } from '../lib/crypto';
-import { useAuth, useChat, useMessages, usePeer } from '../hooks';
+import { formatDuration } from '../lib/format';
+import { useAuth, useChat, useMessages, useOnline, usePeer } from '../hooks';
 import { Avatar, InfoButton, RankBadge } from '../ui';
 import type { Message } from '../types';
+import { getContactName, setContactName } from '../lib/contactNames';
 
 type TabKey = 'media' | 'voice' | 'circle' | 'links';
 
@@ -72,11 +77,6 @@ function useDecryptedUrl(msg: Message, myId: string): string | null {
   return url;
 }
 
-function fmtSec(sec?: number): string {
-  if (!sec || !Number.isFinite(sec)) return '0:00';
-  return `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, '0')}`;
-}
-
 /** Квадратная плитка медиа в стиле Instagram. */
 function MediaTile({
   msg,
@@ -124,7 +124,7 @@ function MediaTile({
           </span>
           {msg.duration !== undefined && (
             <span className="pointer-events-none absolute bottom-1.5 right-1.5 rounded bg-black/55 px-1.5 py-0.5 text-[11px] tabular-nums text-white">
-              {fmtSec(msg.duration)}
+              {formatDuration(msg.duration)}
             </span>
           )}
         </>
@@ -137,14 +137,23 @@ function MediaTile({
 function MediaLightbox({
   msg,
   myId,
+  hasPrev,
+  hasNext,
+  onPrev,
+  onNext,
   onClose,
 }: {
   msg: Message;
   myId: string;
+  hasPrev: boolean;
+  hasNext: boolean;
+  onPrev: () => void;
+  onNext: () => void;
   onClose: () => void;
 }) {
   const url = useDecryptedUrl(msg, myId);
   const [slow, setSlow] = useState(false);
+  const startRef = useRef<{ x: number; y: number } | null>(null);
   const ext = msg.type === 'photo' ? 'jpg' : 'mp4';
 
   useEffect(() => {
@@ -155,8 +164,21 @@ function MediaLightbox({
 
   return (
     <div
-      className="fixed inset-0 z-[80] flex flex-col items-center justify-center gap-4 bg-black/90 p-4"
+      className="fade-in fixed inset-0 z-[80] flex flex-col items-center justify-center gap-4 bg-black/90 p-4"
       onClick={onClose}
+      onPointerDown={(e) => {
+        startRef.current = { x: e.clientX, y: e.clientY };
+      }}
+      onPointerUp={(e) => {
+        const start = startRef.current;
+        if (!start) return;
+        const dx = e.clientX - start.x;
+        const dy = e.clientY - start.y;
+        if (Math.abs(dx) > 60 && Math.abs(dy) < 80) {
+          if (dx < 0 && hasNext) onNext();
+          if (dx > 0 && hasPrev) onPrev();
+        }
+      }}
     >
       <button
         type="button"
@@ -167,13 +189,40 @@ function MediaLightbox({
         <X size={22} />
       </button>
 
+      {hasPrev && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onPrev();
+          }}
+          className="absolute left-3 top-1/2 -translate-y-1/2 rounded-full bg-white/10 p-2 text-white hover:bg-white/20"
+          aria-label="Предыдущее медиа"
+        >
+          <ChevronLeft size={24} />
+        </button>
+      )}
+      {hasNext && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onNext();
+          }}
+          className="absolute right-3 top-1/2 -translate-y-1/2 rounded-full bg-white/10 p-2 text-white hover:bg-white/20"
+          aria-label="Следующее медиа"
+        >
+          <ChevronRight size={24} />
+        </button>
+      )}
+
       {url ? (
         msg.type === 'photo' ? (
           <img
             src={url}
             alt="Фото"
             onClick={(e) => e.stopPropagation()}
-            className="max-h-[80vh] max-w-[92vw] rounded-lg object-contain"
+            className="modal-in max-h-[80vh] max-w-[92vw] rounded-lg object-contain"
           />
         ) : (
           <video
@@ -182,7 +231,7 @@ function MediaLightbox({
             autoPlay
             playsInline
             onClick={(e) => e.stopPropagation()}
-            className="max-h-[80vh] max-w-[92vw] rounded-lg"
+            className="modal-in max-h-[80vh] max-w-[92vw] rounded-lg"
           />
         )
       ) : (
@@ -216,7 +265,17 @@ function MediaGrid({ messages, myId }: { messages: Message[]; myId: string }) {
         ))}
       </div>
       {index !== null && messages[index] && (
-        <MediaLightbox msg={messages[index]} myId={myId} onClose={() => setIndex(null)} />
+        <MediaLightbox
+          msg={messages[index]}
+          myId={myId}
+          hasPrev={index > 0}
+          hasNext={index < messages.length - 1}
+          onPrev={() => setIndex((v) => (v === null ? v : Math.max(0, v - 1)))}
+          onNext={() =>
+            setIndex((v) => (v === null ? v : Math.min(messages.length - 1, v + 1)))
+          }
+          onClose={() => setIndex(null)}
+        />
       )}
     </>
   );
@@ -237,7 +296,7 @@ function ProfileItem({ msg, myId }: { msg: Message; myId: string }) {
             {msg.type === 'voice' ? 'Голосовое' : 'Кружок'}
           </div>
           {msg.duration !== undefined && (
-            <div className="text-[12px] text-text-muted">{fmtSec(msg.duration)}</div>
+            <div className="text-[12px] text-text-muted">{formatDuration(msg.duration)}</div>
           )}
         </div>
         {url && msg.type === 'circle' && (
@@ -264,9 +323,21 @@ export function ProfilePage() {
   const myId = useAuth();
   const { chat } = useChat(chatId ?? null);
   const peer = usePeer(chat, myId);
+  const online = useOnline(chat?.saved ? null : (peer?.id ?? null));
   const messages = useMessages(chatId ?? null);
   const [tab, setTab] = useState<TabKey>('media');
   const [inContacts, setInContacts] = useState<boolean | null>(null);
+  const [customName, setCustomName] = useState<string | null>(null);
+
+  useEffect(() => {
+    setCustomName(peer?.id ? getContactName(peer.id) : null);
+  }, [peer?.id]);
+
+  useEffect(() => {
+    const sync = () => setCustomName(peer?.id ? getContactName(peer.id) : null);
+    window.addEventListener('contact-name:changed', sync);
+    return () => window.removeEventListener('contact-name:changed', sync);
+  }, [peer?.id]);
 
   useEffect(() => {
     if (!myId || !peer) {
@@ -293,9 +364,17 @@ export function ProfilePage() {
     }
   };
 
+  const editCustomName = () => {
+    if (!peer) return;
+    const next = window.prompt('Своё имя контакта', customName ?? peer.fullName);
+    if (next === null) return;
+    setContactName(peer.id, next);
+    setCustomName(getContactName(peer.id));
+  };
+
   if (!myId || !chatId) return null;
 
-  const title = chat?.saved ? 'Избранное' : peer?.fullName ?? 'Профиль';
+  const title = chat?.saved ? 'Избранное' : customName ?? peer?.fullName ?? 'Профиль';
   const subtitle = chat?.saved ? 'Личные заметки' : peer?.group ?? '';
 
   // Фильтруем видимые сообщения (свои «удалено у себя» не показываем)
@@ -310,6 +389,22 @@ export function ProfilePage() {
     return visible.filter((m) => m.type === 'text');
   }, [visible, tab]);
 
+  if (!chat) {
+    return (
+      <div className="flex h-full flex-col bg-bg">
+        <div className="flex items-center gap-3 border-b border-border px-4 py-3">
+          <div className="h-9 w-9 animate-pulse rounded-full bg-surface" />
+          <div className="h-4 w-36 animate-pulse rounded bg-surface" />
+        </div>
+        <div className="grid grid-cols-3 gap-1 p-4">
+          {Array.from({ length: 6 }).map((_, index) => (
+            <div key={index} className="aspect-square animate-pulse rounded bg-surface" />
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full flex-col bg-bg">
       <header className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-3">
@@ -322,21 +417,59 @@ export function ProfilePage() {
           <ArrowLeft size={20} />
         </button>
         <div className="flex min-w-0 flex-1 items-center gap-3">
-          <Avatar name={title} size="md" seed={chat?.saved ? `${myId}-saved` : peer?.id ?? chatId} />
+          <div className="relative shrink-0">
+            <Avatar name={title} size="md" seed={chat?.saved ? `${myId}-saved` : (peer?.id ?? chatId)} />
+            {online && (
+              <span
+                className="absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-bg bg-green-500"
+                title="Онлайн"
+                aria-label="Онлайн"
+              />
+            )}
+          </div>
           <div className="min-w-0 flex-1">
             <div className="flex min-w-0 items-center gap-1.5">
               <span className="truncate text-[17px] font-medium text-text">{title}</span>
-              {!chat?.saved && peer?.rank && <RankBadge rank={peer.rank} size="sm" />}
+              {customName && (
+                <Star
+                  size={15}
+                  className="shrink-0 text-accent"
+                  fill="currentColor"
+                  aria-label="Своё имя контакта"
+                />
+              )}
+              {!chat?.saved &&
+                peer?.rank &&
+                !/^рядовой(\s+полиции)?$/i.test(peer.rank.trim()) && (
+                  <RankBadge rank={peer.rank} size="sm" />
+                )}
             </div>
             <div className="truncate text-[13px] text-text-muted">
               {subtitle ||
                 (peer?.position ? `${peer.position}${peer.group ? ` · ${peer.group}` : ''}` : '')}
             </div>
+            {!chat?.saved && peer?.status && (
+              <div className="truncate text-[13px] text-accent">{peer.status}</div>
+            )}
+            {!chat?.saved && peer?.bio && (
+              <div className="line-clamp-2 text-[12px] text-text-muted">{peer.bio}</div>
+            )}
             {!chat?.saved && peer?.department && (
               <div className="truncate text-[12px] text-text-muted">{peer.department}</div>
             )}
           </div>
         </div>
+        {!chat?.saved && (
+          <button
+            type="button"
+            onClick={editCustomName}
+            className="shrink-0 rounded-lg p-2 text-text-muted hover:bg-surface hover:text-text"
+            aria-label="Своё имя контакта"
+            title="Своё имя контакта"
+          >
+            <Pencil size={18} />
+          </button>
+        )}
         {!chat?.saved && (
           <button
             type="button"
@@ -451,3 +584,4 @@ function LinkListView({ messages, myId }: { messages: Message[]; myId: string })
     </div>
   );
 }
+

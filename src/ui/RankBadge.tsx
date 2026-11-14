@@ -12,7 +12,7 @@ import type { Rank } from '../types';
  * и в размере 88 px, и в шапке чата.
  */
 
-type StarKind = 'small' | 'officer' | 'general';
+type StarKind = 'small' | 'junior' | 'senior' | 'general';
 
 interface RankConfig {
   stripes?: number;
@@ -34,17 +34,24 @@ const CONFIG: Record<Rank, RankConfig> = {
   старшина: { lengthwise: true },
   прапорщик: { prosvets: 1, stars: 2, starKind: 'small' },
   'старший прапорщик': { prosvets: 1, stars: 3, starKind: 'small' },
-  'младший лейтенант': { prosvets: 1, stars: 1, starKind: 'officer' },
-  лейтенант: { prosvets: 1, stars: 2, starKind: 'officer' },
-  'старший лейтенант': { prosvets: 1, stars: 3, starKind: 'officer' },
-  капитан: { prosvets: 1, stars: 4, starKind: 'officer' },
-  майор: { prosvets: 2, stars: 1, starKind: 'officer' },
-  подполковник: { prosvets: 2, stars: 2, starKind: 'officer' },
-  полковник: { prosvets: 2, stars: 3, starKind: 'officer' },
+  // Младшие офицеры — звёзды 13 мм на одном просвете.
+  'младший лейтенант': { prosvets: 1, stars: 1, starKind: 'junior' },
+  лейтенант: { prosvets: 1, stars: 2, starKind: 'junior' },
+  'старший лейтенант': { prosvets: 1, stars: 3, starKind: 'junior' },
+  капитан: { prosvets: 1, stars: 4, starKind: 'junior' },
+  // Старшие офицеры — звёзды 20 мм между двумя просветами.
+  майор: { prosvets: 2, stars: 1, starKind: 'senior' },
+  подполковник: { prosvets: 2, stars: 2, starKind: 'senior' },
+  полковник: { prosvets: 2, stars: 3, starKind: 'senior' },
+  // Генералы — звёзды 22 мм без просветов.
   'генерал-майор': { prosvets: 0, stars: 1, starKind: 'general' },
   'генерал-лейтенант': { prosvets: 0, stars: 2, starKind: 'general' },
   'генерал-полковник': { prosvets: 0, stars: 3, starKind: 'general' },
 };
+
+// Геометрия погона: 1 единица viewBox ≈ 1 мм.
+const CANVAS = { w: 160, h: 60 } as const;
+const BUTTON = { x: 80, y: 8, r: 2.8 } as const;
 
 // Контрастная палитра: знаки должны читаться в мелком размере.
 const FIELD = '#16233d';
@@ -55,9 +62,10 @@ const GOLD_BRIGHT = '#ffd95e';
 const GOLD_EDGE = '#7a5a10';
 
 const STAR_RADIUS: Record<StarKind, number> = {
-  small: 5.2, // 13 мм
-  officer: 7.2, // 20 мм
-  general: 8.6, // 22 мм
+  small: 6.5, // 13 мм — прапорщики
+  junior: 6.5, // 13 мм — младшие офицеры
+  senior: 9.6, // 20 мм — старшие офицеры
+  general: 10.8, // 22 мм — генералы
 };
 
 /** Пятиконечная звезда с тёмной обводкой — читается на тёмном поле. */
@@ -81,71 +89,75 @@ function Star({ x, y, r }: { x: number; y: number; r: number }) {
   );
 }
 
-/** Раскладка звёзд (canvas 160 × 60). */
+/** Раскладка звёзд (canvas 160 × 60) строго по уставным схемам. */
 function starLayout(cfg: RankConfig): Array<{ x: number; y: number }> {
   const n = cfg.stars ?? 0;
   if (!n) return [];
-  const kind = cfg.starKind ?? 'officer';
+  const kind = cfg.starKind ?? 'junior';
   const cy = 30;
 
+  // Генералы: 22 мм, без просветов, в ряд по центру.
   if (kind === 'general') {
-    if (n === 1) return [{ x: 100, y: cy }];
+    if (n === 1) return [{ x: 80, y: 32 }];
     if (n === 2)
       return [
-        { x: 117, y: cy },
-        { x: 83, y: cy },
+        { x: 62, y: 32 },
+        { x: 98, y: 32 },
       ];
     return [
-      { x: 130, y: cy },
-      { x: 100, y: cy },
-      { x: 70, y: cy },
+      { x: 56, y: 32 },
+      { x: 80, y: 32 },
+      { x: 104, y: 32 },
     ];
   }
 
+  // Прапорщики: 13 мм на одном просвете.
   if (kind === 'small') {
     if (n === 2)
       return [
-        { x: 130, y: cy },
-        { x: 100, y: cy },
+        { x: 64, y: cy },
+        { x: 96, y: cy },
       ];
     return [
-      { x: 132, y: cy },
-      { x: 106, y: cy },
+      { x: 58, y: cy },
       { x: 80, y: cy },
+      { x: 102, y: cy },
     ];
   }
 
-  if (cfg.prosvets === 2) {
-    if (n === 1) return [{ x: 100, y: cy }];
+  // Старшие офицеры: 20 мм между двумя просветами (по центру поля).
+  if (kind === 'senior') {
+    if (n === 1) return [{ x: 80, y: cy }];
     if (n === 2)
       return [
-        { x: 112, y: 17 },
-        { x: 112, y: 43 },
+        { x: 64, y: cy },
+        { x: 96, y: cy },
       ];
     return [
-      { x: 132, y: 17 },
-      { x: 132, y: 43 },
-      { x: 96, y: cy },
+      { x: 60, y: 44 },
+      { x: 100, y: 44 },
+      { x: 80, y: 20 },
     ];
   }
 
-  if (n === 1) return [{ x: 100, y: cy }];
+  // Младшие офицеры: 13 мм на одном просвете.
+  if (n === 1) return [{ x: 80, y: cy }];
   if (n === 2)
     return [
-      { x: 100, y: 17 },
-      { x: 100, y: 43 },
+      { x: 58, y: cy },
+      { x: 102, y: cy },
     ];
   if (n === 3)
     return [
-      { x: 114, y: 17 },
-      { x: 114, y: 43 },
-      { x: 78, y: cy },
+      { x: 58, y: 40 },
+      { x: 102, y: 40 },
+      { x: 80, y: 18 },
     ];
   return [
-    { x: 120, y: 17 },
-    { x: 120, y: 43 },
-    { x: 82, y: cy },
-    { x: 50, y: cy },
+    { x: 58, y: 20 },
+    { x: 102, y: 20 },
+    { x: 58, y: 40 },
+    { x: 102, y: 40 },
   ];
 }
 
@@ -177,7 +189,8 @@ export function formatRank(rank?: string): string {
 
 export interface RankBadgeProps {
   rank?: string;
-  size?: 'sm' | 'md' | 'lg';
+  /** xs — 24 px по высоте (списки), sm — 36, md — 54, lg — 75 */
+  size?: 'xs' | 'sm' | 'md' | 'lg';
   className?: string;
   /** всплывающая подсказка (по умолчанию — полное название звания) */
   title?: string;
@@ -196,18 +209,24 @@ export function RankBadge({ rank, size = 'md', className, title }: RankBadgeProp
   const cfg: RankConfig = key ? CONFIG[key] : {};
 
   const dims =
-    size === 'lg' ? { w: 200, h: 75 } : size === 'sm' ? { w: 96, h: 36 } : { w: 144, h: 54 };
+    size === 'lg'
+      ? { w: 200, h: 75 }
+      : size === 'md'
+        ? { w: 144, h: 54 }
+        : size === 'sm'
+          ? { w: 96, h: 36 }
+          : { w: 64, h: 24 };
 
   const label = title ?? formatRank(rank) ?? 'Погон';
-  const starKind = cfg.starKind ?? 'officer';
+  const starKind = cfg.starKind ?? 'junior';
 
   return (
     <svg
-      viewBox="0 0 160 60"
+      viewBox={`0 0 ${CANVAS.w} ${CANVAS.h}`}
       width={dims.w}
       height={dims.h}
       role="img"
-      className={clsx('shrink-0 select-none', className)}
+      className={clsx('rank-badge shrink-0 select-none', className)}
       aria-label={label}
     >
       <title>{label || 'Погон'}</title>
@@ -232,8 +251,8 @@ export function RankBadge({ rank, size = 'md', className, title }: RankBadgeProp
       />
 
       {/* пуговица */}
-      <circle cx={80} cy={10} r={3.2} fill={GOLD} stroke={GOLD_EDGE} strokeWidth="0.8" />
-      <circle cx={79.1} cy={9.1} r={0.9} fill="rgba(255,255,255,0.7)" />
+      <circle cx={BUTTON.x} cy={BUTTON.y} r={BUTTON.r} fill={GOLD} stroke={GOLD_EDGE} strokeWidth="0.8" />
+      <circle cx={BUTTON.x - 0.8} cy={BUTTON.y - 0.8} r={0.8} fill="rgba(255,255,255,0.7)" />
 
       {/* КУРСАНТ: продольные полосы + «К» */}
       {cfg.cadet && (

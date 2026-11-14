@@ -17,6 +17,8 @@ export type BusEventType =
   | 'presence'
   | 'keys:updated'
   | 'avatar:updated'
+  | 'profile:updated'
+  | 'mention:new'
   | 'broadcast:new'
   | 'settings:changed';
 

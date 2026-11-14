@@ -1,24 +1,33 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ChangeEvent, KeyboardEvent, ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   ArrowDown,
   ArrowLeft,
   ArrowUp,
+  BarChart3,
   Camera,
   CircleDot,
   CornerUpLeft,
   Image as ImageIcon,
+  ListChecks,
+  MapPin,
   Mic,
   MoreVertical,
   Paperclip,
+  Phone,
+  Pin,
   Search,
   Send,
+  Smile,
+  SmilePlus,
   Square,
+  Video,
   X,
 } from 'lucide-react';
 import * as db from '../lib/db';
 import { encryptFor, encryptForGroup } from '../lib/crypto';
+import { getContactName } from '../lib/contactNames';
 import {
   useAuth,
   useChat,
@@ -32,6 +41,19 @@ import {
   useTypingNotifier,
 } from '../hooks';
 import { emit } from '../lib/bus';
+import { validateFileSize, validateMediaType } from '../lib/validation';
+import { pluralParticipants } from '../lib/format';
+import { getPinnedId, savePinnedId } from '../lib/pins';
+import { STICKERS, toSticker } from '../lib/stickers';
+import { MAX_DOCUMENT_BYTES, isDocumentFile, packFileMeta } from '../lib/documents';
+import { CallOverlay } from './CallOverlay';
+import type { CallRequest } from './CallOverlay';
+import { ForwardModal } from './ForwardModal';
+import { broadcastMention } from '../lib/realtime';
+import { encodePoll } from '../lib/polls';
+import { getReaction, toggleReaction } from '../lib/reactions';
+import { encodeLocation } from '../lib/location';
+import { encodeTodo } from '../lib/todo';
 import { Avatar, InfoButton, RankBadge } from '../ui';
 import { MessageBubble } from './MessageBubble';
 import {
@@ -40,6 +62,7 @@ import {
   CircleCaptureModal,
   MAX_CIRCLE_SECONDS,
   MessageActionsMenu,
+  ModalOverlay,
   PhotoCaptureModal,
 } from './chat-modals';
 import type { Message, MessageType, User } from '../types';
@@ -52,6 +75,11 @@ import type { Message, MessageType, User } from '../types';
 function newId(): string {
   return db.uid();
 }
+
+/** Единые тексты ошибок и MIME по умолчанию — без повторов в трёх местах. */
+const PARTICIPANTS_ERROR = 'не удалось определить участников чата';
+const DEFAULT_MEDIA_MIME = 'application/octet-stream';
+const EMOJI_PANEL = ['😀','😂','😊','😍','😎','🤔','😅','😢','😡','👍','👎','👏','🙏','💪','❤️','🔥','🎉','✅','⚡','☕','🚀','📌','📎','💬'];
 
 function pickMimeType(kind: 'audio' | 'video'): string {
   const candidates =
@@ -106,6 +134,25 @@ function fmtTimer(sec: number): string {
   const s = Math.max(0, Math.floor(sec));
   const m = Math.floor(s / 60);
   return `${m}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function fmtLastSeen(ts: number): string {
+  const date = new Date(ts);
+  const now = new Date();
+  const time = date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+  const sameDay =
+    date.getDate() === now.getDate() &&
+    date.getMonth() === now.getMonth() &&
+    date.getFullYear() === now.getFullYear();
+  if (sameDay) return `в ${time}`;
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  const isYesterday =
+    date.getDate() === yesterday.getDate() &&
+    date.getMonth() === yesterday.getMonth() &&
+    date.getFullYear() === yesterday.getFullYear();
+  if (isYesterday) return `вчера в ${time}`;
+  return `${date.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' })} в ${time}`;
 }
 
 /** Короткий текст цитаты для ответа (plus мусор удалён -> «Сообщение удалено») */
@@ -163,6 +210,26 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
   const groupPeerId = isGroupChat ? null : peer?.id ?? null;
   const online = useOnline(isSaved ? null : groupPeerId);
   const peerTyping = usePeerTyping(chatId, isSaved ? null : groupPeerId);
+  const [lastSeenAt, setLastSeenAt] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!peer?.id || isSaved || isGroupChat) {
+      setLastSeenAt(null);
+      return;
+    }
+    let alive = true;
+    const load = () => {
+      void db.getPresence(peer.id).then((presence) => {
+        if (alive && presence?.showLastSeen) setLastSeenAt(presence.lastSeen);
+      });
+    };
+    load();
+    const timer = window.setInterval(load, 30000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [peer?.id, isSaved, isGroupChat]);
   // При открытии чата обновляем публичные ключи участников (офлайн-расшифровка).
   useFreshKeysOnChatOpen(chatId, myId, isSaved ? null : groupPeerId);
 
@@ -173,13 +240,29 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [addMembersOpen, setAddMembersOpen] = useState(false);
   const [actionMsg, setActionMsg] = useState<Message | null>(null);
+  const [forwardMsg, setForwardMsg] = useState<Message | null>(null);
   const [editing, setEditing] = useState<Message | null>(null);
   const [replyTo, setReplyTo] = useState<Message | null>(null);
+  const [pinnedId, setPinnedId] = useState<string | null>(null);
+  const [pinnedText, setPinnedText] = useState<string | null>(null);
+  const [stickersOpen, setStickersOpen] = useState(false);
+  const [emojiOpen, setEmojiOpen] = useState(false);
+  const [callRequest, setCallRequest] = useState<CallRequest>(null);
+  const [pollOpen, setPollOpen] = useState(false);
+  const [todoOpen, setTodoOpen] = useState(false);
+  const [todoItems, setTodoItems] = useState(['', '']);
+  const [pollQ, setPollQ] = useState('');
+  const [pollOptions, setPollOptions] = useState(['', '']);
+  const [reactionTick, setReactionTick] = useState(0);
+  const [readStates, setReadStates] = useState<Array<{ userId: string; lastReadAt: number }>>([]);
+  const [readerUsers, setReaderUsers] = useState<User[]>([]);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchIndex, setSearchIndex] = useState<Map<string, string>>(new Map());
+  const [filesOnly, setFilesOnly] = useState(false);
   const [activeSearchIndex, setActiveSearchIndex] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [initialLoading, setInitialLoading] = useState(true);
 
   // Архив текущего чата: показываем кнопку «Разархивировать» в настройках
   const [isArchived, setIsArchived] = useState(false);
@@ -246,12 +329,18 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
   const mediaSendingRef = useRef(false);
   const stickToBottomRef = useRef(true);
   // Анти-флуд: не чаще 1 сообщения в секунду (текст и медиа)
-  const lastSendAtRef = useRef(0);
-
-  const floodLimited = (): boolean => {
+  /**
+   * Антиспам: запрещаем только повтор ТОГО ЖЕ текста в течение секунды.
+   * Разные сообщения можно отправлять быстро — иначе не проходит ни
+   * нормальная переписка, ни нагрузочный тест.
+   */
+  const lastTextRef = useRef<{ text: string; at: number }>({ text: '', at: 0 });
+  const floodLimited = (text: string): boolean => {
     const now = Date.now();
-    if (now - lastSendAtRef.current < 1000) return true;
-    lastSendAtRef.current = now;
+    const normalized = text.trim().toLowerCase();
+    const last = lastTextRef.current;
+    if (last.text === normalized && now - last.at < 1000) return true;
+    lastTextRef.current = { text: normalized, at: now };
     return false;
   };
 
@@ -268,6 +357,17 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
     if (!el || !stickToBottomRef.current) return;
     el.scrollTop = el.scrollHeight;
   }, [messages.length, chatId]);
+
+  // Скелетон ленты: показываем при открытии чата, пока не пришли сообщения.
+  useEffect(() => {
+    setInitialLoading(true);
+    const timer = window.setTimeout(() => setInitialLoading(false), 700);
+    return () => window.clearTimeout(timer);
+  }, [chatId]);
+
+  useEffect(() => {
+    if (messages.length > 0) setInitialLoading(false);
+  }, [messages.length]);
 
   // --- прочитано ------------------------------------------------------------------
 
@@ -326,10 +426,44 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
     // «Удалил у себя»: сообщения, где мой id в deleted_for, из ленты убираем,
     // у собеседника они остаются (это периферия удаления «только у себя»).
     const base = myId ? messages.filter((m) => !(m.deletedFor ?? []).includes(myId)) : messages;
+    const mediaTypes: Array<Message['type']> = ['photo', 'video', 'voice', 'circle', 'document'];
+    const byFiles = filesOnly ? base.filter((m) => mediaTypes.includes(m.type)) : base;
     const q = searchQuery.trim().toLowerCase();
-    if (!searchOpen || !q) return base;
-    return base.filter((m) => (searchIndex.get(m.id) ?? '').toLowerCase().includes(q));
-  }, [messages, myId, searchOpen, searchQuery, searchIndex]);
+    if (!searchOpen || !q) return byFiles;
+    return byFiles.filter((m) => (searchIndex.get(m.id) ?? '').toLowerCase().includes(q));
+  }, [messages, myId, searchOpen, searchQuery, searchIndex, filesOnly]);
+
+  // Закреплённое сообщение — персональная закладка этого устройства.
+  useEffect(() => {
+    setPinnedId(chatId ? getPinnedId(chatId) : null);
+    setPinnedText(null);
+  }, [chatId]);
+
+  const pinnedMessage = useMemo(
+    () => messages.find((m) => m.id === pinnedId && !m.deleted) ?? null,
+    [messages, pinnedId],
+  );
+
+  useEffect(() => {
+    if (!pinnedMessage || !myId) {
+      setPinnedText(null);
+      return;
+    }
+    let alive = true;
+    void db.readMessageText(pinnedMessage, myId).then((value) => {
+      if (alive) setPinnedText(value);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [pinnedMessage, myId]);
+
+  useEffect(() => {
+    if (pinnedId && messages.length > 0 && !pinnedMessage) {
+      setPinnedId(null);
+      savePinnedId(chatId, null);
+    }
+  }, [pinnedId, pinnedMessage, messages.length, chatId]);
 
   const searchHits = useMemo(() => {
     if (!searchOpen || !searchQuery.trim()) return 0;
@@ -391,33 +525,114 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
    * (старая база, сбой генерации), она создаётся на месте — отправка не падает
    * с «приватный ключ не найден».
    */
-  const resolveKeys = async (): Promise<{ me: User; peer: User } | null> => {
+  const resolveKeys = useCallback(async (): Promise<{ me: User; peer: User } | null> => {
     if (!myId || !me || !peer) return null;
     const freshMe = (await db.ensureUserKeyPair(myId)) ?? me;
     const freshPeer = (await db.ensureUserKeyPair(peer.id)) ?? peer;
     return { me: freshMe, peer: freshPeer };
-  };
+  }, [myId, me, peer]);
+
+  /** Кэш публичных ключей участников группы: не дёргаем сеть на каждое сообщение. */
+  const groupMembersRef = useRef<{
+    key: string;
+    members: Array<{ id: string; publicKeyJwk: JsonWebKey }>;
+  } | null>(null);
 
   /** Все участники группового чата с публичными ключами (для E2EE в группе) */
-  const resolveGroupMembers = async (): Promise<Array<{ id: string; publicKeyJwk: JsonWebKey }> | null> => {
+  const resolveGroupMembers = useCallback(async (): Promise<
+    Array<{ id: string; publicKeyJwk: JsonWebKey }> | null
+  > => {
     if (!chat || !chat.participants || chat.participants.length === 0) return null;
+    const cacheKey = chat.participants.join(',');
+    if (groupMembersRef.current?.key === cacheKey) return groupMembersRef.current.members;
+
     const members: Array<{ id: string; publicKeyJwk: JsonWebKey }> = [];
     for (const id of chat.participants) {
-      const fresh = (await db.ensureUserKeyPair(id)) ?? (await db.getUserById(id));
+      // Свою пару при необходимости чиним, чужие ключи только читаем:
+      // создавать чужие приватные ключи на этом устройстве нельзя.
+      const fresh =
+        id === myId
+          ? (await db.ensureUserKeyPair(id)) ?? (await db.getUserById(id))
+          : await db.getUserById(id);
       if (fresh) members.push({ id: fresh.id, publicKeyJwk: fresh.publicKeyJwk });
     }
-    return members.length > 0 ? members : null;
+    if (members.length === 0) return null;
+    groupMembersRef.current = { key: cacheKey, members };
+    return members;
+  }, [chat, myId]);
+
+  /**
+   * Один путь шифрования для текста, правки и медиа: убирает три копии
+   * одинаковой ветки «группа/личный чат» и заодно мемоизирует зависимости.
+   */
+  const encryptForChat = useCallback(
+    async (data: string | ArrayBuffer) => {
+      if (!myId) throw new Error('не удалось определить автора');
+      if (isGroup) {
+        const members = await resolveGroupMembers();
+        if (!members) throw new Error(PARTICIPANTS_ERROR);
+        const mine = members.find((member) => member.id === myId);
+        if (!mine) throw new Error(PARTICIPANTS_ERROR);
+        return encryptForGroup({
+          myId,
+          myPublicKeyJwk: mine.publicKeyJwk,
+          members,
+          data,
+        });
+      }
+      const keys = await resolveKeys();
+      if (!keys) throw new Error(PARTICIPANTS_ERROR);
+      return encryptFor({
+        myId,
+        myPublicKeyJwk: keys.me.publicKeyJwk,
+        peerPublicKeyJwk: keys.peer.publicKeyJwk,
+        data,
+      });
+    },
+    [isGroup, myId, resolveKeys, resolveGroupMembers],
+  );
+
+  /**
+   * Очередь исходящих текстовых сообщений: при быстрой отправке (или
+   * нагрузочном тесте) сообщения не теряются из-за флага «занято», а уходят
+   * строго по порядку.
+   */
+  const outboxRef = useRef<Array<{ value: string; replyToId?: string }>>([]);
+
+  const sendLocation = () => {
+    setMenuOpen(false);
+    if (!navigator.geolocation) {
+      alert('Геолокация недоступна в этом браузере');
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        void sendText(
+          encodeLocation(position.coords.latitude, position.coords.longitude),
+        );
+      },
+      () => alert('Не удалось получить геолокацию'),
+      { timeout: 8000 },
+    );
   };
 
-  const sendText = async (value: string) => {
-    const trimmed = value.trim();
-    // Пустые сообщения (только пробелы) не отправляются. Собеседник обязателен
-    // только для личного чата: у группы его может не быть вовсе.
-    if (!trimmed || !me || !myId || sendingRef.current) return;
-    if (!isGroup && !peer) return;
-    if (floodLimited()) return;
-    const replyToId = replyTo?.id;
-    sendingRef.current = true;
+  const notifyMentions = async (text: string) => {    if (!myId || !chat?.participants?.length) return;
+    const logins = Array.from(
+      new Set(Array.from(text.matchAll(/@([a-z0-9._-]+)/gi)).map((m) => m[1].toLowerCase())),
+    );
+    if (logins.length === 0) return;
+    const ids: string[] = [];
+    for (const login of logins) {
+      const user = await db.findUserByLogin(login);
+      if (user && user.id !== myId && chat.participants.includes(user.id)) ids.push(user.id);
+    }
+    if (ids.length > 0) {
+      void broadcastMention({ chatId, from: myId, userIds: ids, text: text.slice(0, 120) });
+    }
+  };
+
+  const deliverText = async (trimmed: string, replyToId?: string) => {
+    if (!myId) return;
     const optimisticId = newId();
     const optimisticMsg: Message = {
       id: optimisticId,
@@ -430,34 +645,13 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
       ciphertext: '',
       iv: '',
     };
-    // Сразу показываем сообщение в ленте (оптимистичный UI), шифруем и пишем в базу.
-    setReplyTo(null);
     try {
-      let fullMsg: Message;
-      if (isGroup) {
-        const members = await resolveGroupMembers();
-        if (!members) throw new Error('не удалось определить участников чата');
-        const group = await encryptForGroup({
-          myId,
-          myPublicKeyJwk: me.publicKeyJwk,
-          members,
-          data: trimmed,
-        });
-        fullMsg = { ...optimisticMsg, ...group };
-      } else {
-        const keys = await resolveKeys();
-        if (!keys) throw new Error('не удалось определить участников чата');
-        const envelope = await encryptFor({
-          myId,
-          myPublicKeyJwk: keys.me.publicKeyJwk,
-          peerPublicKeyJwk: keys.peer.publicKeyJwk,
-          data: trimmed,
-        });
-        fullMsg = { ...optimisticMsg, ...envelope };
-      }
+      const envelope = await encryptForChat(trimmed);
+      const fullMsg: Message = { ...optimisticMsg, ...envelope };
       await db.saveMessageOptimistic(fullMsg, (e) => {
         console.error('sendText optimistic error', e);
       });
+      void notifyMentions(trimmed);
       scrollToBottom();
     } catch (e) {
       console.warn('sendText failed', e);
@@ -466,6 +660,28 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
           ? `Не удалось отправить сообщение: ${e.message}`
           : 'Не удалось отправить сообщение',
       );
+    }
+  };
+
+  const sendText = async (value: string) => {
+    const trimmed = value.trim();
+    // Пустые сообщения (только пробелы) не отправляются. Собеседник обязателен
+    // только для личного чата: у группы его может не быть вовсе.
+    if (!trimmed || !me || !myId) return;
+    if (!isGroup && !peer) return;
+    if (floodLimited(trimmed)) return;
+
+    outboxRef.current.push({ value: trimmed, replyToId: replyTo?.id });
+    setReplyTo(null);
+
+    // Уже идёт отправка — она сама заберёт сообщение из очереди.
+    if (sendingRef.current) return;
+    sendingRef.current = true;
+    try {
+      while (outboxRef.current.length > 0) {
+        const item = outboxRef.current.shift();
+        if (item) await deliverText(item.value, item.replyToId);
+      }
     } finally {
       sendingRef.current = false;
     }
@@ -501,28 +717,11 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
     if (!trimmed) return;
     setBusy(true);
     try {
-      let patch: Parameters<typeof db.updateMessage>[1];
-      if (isGroup) {
-        const members = await resolveGroupMembers();
-        if (!members) throw new Error('не удалось определить участников чата');
-        const group = await encryptForGroup({
-          myId,
-          myPublicKeyJwk: me.publicKeyJwk,
-          members,
-          data: trimmed,
-        });
-        patch = { ...group, editedAt: Date.now() };
-      } else {
-        const keys = await resolveKeys();
-        if (!keys) throw new Error('не удалось определить участников чата');
-        const envelope = await encryptFor({
-          myId,
-          myPublicKeyJwk: keys.me.publicKeyJwk,
-          peerPublicKeyJwk: keys.peer.publicKeyJwk,
-          data: trimmed,
-        });
-        patch = { ...envelope, editedAt: Date.now() };
-      }
+      const envelope = await encryptForChat(trimmed);
+      const patch: Parameters<typeof db.updateMessage>[1] = {
+        ...envelope,
+        editedAt: Date.now(),
+      };
       await db.updateMessage(editing.id, patch);
       setEditing(null);
       setText('');
@@ -538,37 +737,25 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
   const sendMedia = async (
     type: MessageType,
     blob: Blob,
-    extra?: { duration?: number; waveform?: number[] },
+    extra?: { duration?: number; waveform?: number[]; fileName?: string },
   ) => {
     if ((!peer && !isGroup) || !me || !myId || mediaSendingRef.current) return;
-    if (floodLimited()) return;
+    const limit = type === 'document' ? MAX_DOCUMENT_BYTES : undefined;
+    const sizeCheck = limit ? validateFileSize(blob.size, limit) : validateFileSize(blob.size);
+    if (!sizeCheck.ok) {
+      alert(sizeCheck.error ?? 'Файл слишком большой');
+      return;
+    }
     mediaSendingRef.current = true;
     setBusy(true);
     try {
       const buf = await blob.arrayBuffer();
-      let envelope: Parameters<typeof db.saveMediaMessage>[1];
-      let groupKeys: Message['groupKeys'];
-      if (isGroup) {
-        const members = await resolveGroupMembers();
-        if (!members) throw new Error('не удалось определить участников чата');
-        const group = await encryptForGroup({
-          myId,
-          myPublicKeyJwk: me.publicKeyJwk,
-          members,
-          data: buf,
-        });
-        envelope = group;
-        groupKeys = group.groupKeys;
-      } else {
-        const keys = await resolveKeys();
-        if (!keys) throw new Error('не удалось определить участников чата');
-        envelope = await encryptFor({
-          myId,
-          myPublicKeyJwk: keys.me.publicKeyJwk,
-          peerPublicKeyJwk: keys.peer.publicKeyJwk,
-          data: buf,
-        });
-      }
+      const encrypted = await encryptForChat(buf);
+      const envelope: Parameters<typeof db.saveMediaMessage>[1] = encrypted;
+      const groupKeys: Message['groupKeys'] =
+        'groupKeys' in encrypted
+          ? (encrypted.groupKeys as Message['groupKeys'])
+          : undefined;
       await db.saveMediaMessage(
         {
           id: newId(),
@@ -576,7 +763,14 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
           senderId: myId,
           type,
           replyToId: replyTo?.id,
-          mimeType: blob.type || 'application/octet-stream',
+          mimeType:
+            type === 'document'
+              ? packFileMeta(
+                  blob.type || 'application/octet-stream',
+                  extra?.fileName ?? 'Файл',
+                  blob.size,
+                )
+              : blob.type || DEFAULT_MEDIA_MIME,
           duration: extra?.duration,
           waveform: extra?.waveform,
           groupKeys,
@@ -602,6 +796,32 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
+
+    // Документы — отдельная ветка: до 50 МБ, любые офисные/архивные форматы.
+    if (!file.type.startsWith('image/') && !file.type.startsWith('video/')) {
+      if (!isDocumentFile(file.name, file.type)) {
+        alert('Этот тип файла не поддерживается');
+        return;
+      }
+      const docCheck = validateFileSize(file.size, MAX_DOCUMENT_BYTES);
+      if (!docCheck.ok) {
+        alert(docCheck.error ?? 'Документ слишком большой');
+        return;
+      }
+      await sendMedia('document', file, { fileName: file.name });
+      return;
+    }
+
+    const typeCheck = validateMediaType(file.type);
+    if (!typeCheck.ok) {
+      alert(typeCheck.error ?? 'Недопустимый тип файла');
+      return;
+    }
+    const sizeCheck = validateFileSize(file.size);
+    if (!sizeCheck.ok) {
+      alert(sizeCheck.error ?? 'Файл слишком большой');
+      return;
+    }
     try {
       if (file.type.startsWith('image/')) {
         await sendMedia('photo', await downscaleImage(file));
@@ -614,8 +834,6 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
           return;
         }
         await sendMedia('video', file);
-      } else {
-        alert('Поддерживаются только фото и видео');
       }
     } catch {
       alert('Не удалось обработать файл');
@@ -722,7 +940,7 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
 
   // --- действия над сообщением ---------------------------------------------------------
 
-  const openActions = (msg: Message) => setActionMsg(msg);
+  const openActions = useCallback((msg: Message) => setActionMsg(msg), []);
 
   const startReply = () => {
     if (!actionMsg || actionMsg.deleted) return;
@@ -862,6 +1080,50 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
     }
   };
 
+  // Кто прочитал сообщения (для галочек под своими сообщениями).
+  useEffect(() => {
+    if (!chatId) return;
+    let alive = true;
+    void db
+      .getChatReaders(chatId)
+      .then((rows) => {
+        if (alive) setReadStates(rows);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [chatId, messages.length]);
+
+  useEffect(() => {
+    if (!myId) return;
+    const ids = readStates.map((row) => row.userId).filter((id) => id !== myId);
+    if (ids.length === 0) {
+      setReaderUsers([]);
+      return;
+    }
+    let alive = true;
+    void Promise.all(ids.map((id) => db.getUserById(id))).then((users) => {
+      if (alive) setReaderUsers(users.filter((u): u is User => Boolean(u)));
+    });
+    return () => {
+      alive = false;
+    };
+  }, [readStates, myId]);
+
+  const readersFor = (message: Message): User[] | undefined => {
+    if (message.senderId !== myId) return undefined;
+    return readerUsers.filter(
+      (user) =>
+        (readStates.find((row) => row.userId === user.id)?.lastReadAt ?? 0) >= message.createdAt,
+    );
+  };
+
+  const reactionOf = (messageId: string): string | undefined => {
+    void reactionTick;
+    return getReaction(messageId) ?? undefined;
+  };
+
   // --- рендер -----------------------------------------------------------------------
 
   if (!chatLoaded || !me) {
@@ -910,21 +1172,18 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
     return <div className="flex h-full items-center justify-center text-text-muted">Загрузка…</div>;
   }
 
-  const title = isSaved ? 'Избранное' : isGroup ? (chat.title ?? peer.fullName) : peer.fullName;
+  const title = isSaved ? 'Избранное' : isGroup ? (chat.title ?? peer.fullName) : getContactName(peer.id) ?? peer.fullName;
   const members = chat.participants?.length ?? 0;
-  const membersLabel =
-    members % 10 === 1 && members % 100 !== 11
-      ? `${members} участник`
-      : members % 10 >= 2 && members % 10 <= 4 && (members % 100 < 12 || members % 100 > 14)
-        ? `${members} участника`
-        : `${members} участников`;
+  const membersLabel = `${members} ${pluralParticipants(members)}`;
   const subtitle = peerTyping
     ? 'печатает…'
     : isSaved
       ? 'Личные заметки'
       : isGroupChat
         ? membersLabel
-        : [peer.position, peer.department].filter(Boolean).join(' · ') || peer.group;
+        : !online && lastSeenAt
+          ? `был(а) в сети ${fmtLastSeen(lastSeenAt)}`
+          : [peer.position, peer.department].filter(Boolean).join(' · ') || peer.group;
 
   return (
     <div className="flex h-full min-w-0 flex-col bg-bg">
@@ -966,7 +1225,9 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
             <div className="min-w-0 flex-1">
               <div className="flex min-w-0 items-center gap-1.5">
                 <span className="truncate text-[15px] font-medium text-text">{title}</span>
-                {!isSaved && peer.rank && <RankBadge rank={peer.rank} size="sm" />}
+                {!isSaved && peer.rank && !/^рядовой(\s+полиции)?$/i.test(peer.rank.trim()) && (
+                  <RankBadge rank={peer.rank} size="sm" />
+                )}
               </div>
               <div
                 className={`truncate text-[13px] ${peerTyping ? 'text-accent' : 'text-text-muted'}`}
@@ -988,6 +1249,29 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
             user={peer}
             title="Информация о пользователе"
           />
+        )}
+
+        {!isSaved && !isGroupChat && peer && (
+          <>
+            <button
+              type="button"
+              onClick={() => setCallRequest({ mode: 'audio', nonce: Date.now() })}
+              className="shrink-0 rounded-lg p-2 text-text-muted hover:bg-surface hover:text-text"
+              aria-label="Позвонить"
+              title="Аудиозвонок"
+            >
+              <Phone size={18} />
+            </button>
+            <button
+              type="button"
+              onClick={() => setCallRequest({ mode: 'video', nonce: Date.now() })}
+              className="shrink-0 rounded-lg p-2 text-text-muted hover:bg-surface hover:text-text"
+              aria-label="Видеозвонок"
+              title="Видеозвонок"
+            >
+              <Video size={18} />
+            </button>
+          </>
         )}
 
         <button
@@ -1024,6 +1308,17 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
             autoFocus
             className="min-w-0 flex-1 bg-transparent text-[15px] text-text placeholder:text-text-muted focus:outline-none"
           />
+          <button
+            type="button"
+            onClick={() => setFilesOnly((v) => !v)}
+            className={`shrink-0 rounded-lg px-2 py-1 text-[12px] font-medium ${
+              filesOnly ? 'bg-accent/15 text-accent' : 'text-text-muted hover:bg-surface hover:text-text'
+            }`}
+            aria-pressed={filesOnly}
+            aria-label="Показывать только файлы"
+          >
+            Файлы
+          </button>
           {searchQuery.trim() && searchHits > 0 && (
             <span className="shrink-0 text-[13px] tabular-nums text-text-muted">
               {Math.min(activeSearchIndex + 1, searchHits)}/{searchHits}
@@ -1110,13 +1405,58 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
         </div>
       )}
 
+      {/* закреплённое сообщение */}
+      {pinnedMessage && (
+        <div className="flex shrink-0 items-center gap-2 border-b border-border bg-surface px-4 py-2">
+          <Pin size={14} className="shrink-0 text-accent" />
+          <button
+            type="button"
+            onClick={() =>
+              msgRefs.current
+                .get(pinnedMessage.id)
+                ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+            }
+            className="min-w-0 flex-1 text-left"
+          >
+            <span className="text-[12px] text-accent">Закреплено</span>
+            <span className="block truncate text-[13px] text-text">
+              {pinnedText ?? 'Сообщение'}
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setPinnedId(null);
+              savePinnedId(chatId, null);
+            }}
+            className="rounded-lg p-1.5 text-text-muted hover:bg-bg hover:text-text"
+            aria-label="Открепить сообщение"
+          >
+            <X size={16} />
+          </button>
+        </div>
+      )}
+
       {/* лента */}
       <div
         ref={listRef}
         onScroll={onListScroll}
         className="flex-1 space-y-3 overflow-y-auto px-3 py-3 sm:px-4"
       >
-        {visibleMessages.length === 0 && (
+        {initialLoading && messages.length === 0 && (
+          <div className="space-y-3">
+            {[0, 1, 2, 3].map((i) => (
+              <div key={i} className={`flex ${i % 2 ? 'justify-end' : 'justify-start'}`}>
+                <div
+                  className={`h-10 animate-pulse rounded-lg bg-surface ${
+                    i % 2 ? 'w-40' : 'w-56'
+                  }`}
+                />
+              </div>
+            ))}
+          </div>
+        )}
+        {visibleMessages.length === 0 && !initialLoading && (
           <div className="flex h-full items-center justify-center px-6 text-center text-[13px] text-text-muted">
             {searchOpen && searchQuery.trim()
               ? 'Ничего не найдено'
@@ -1143,6 +1483,8 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
                 peerPublicKeyJwk={isSaved ? me.publicKeyJwk : peer.publicKeyJwk}
                 showSenderName={isGroupChat && m.senderId !== myId}
                 highlight={searchOpen ? searchQuery : ''}
+                readers={readersFor(m)}
+                reaction={reactionOf(m.id)}
                 onLongPress={openActions}
               />
             </div>
@@ -1197,6 +1539,19 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
                   setCircleOpen(true);
                 }}
               />
+              <MenuButton
+                icon={<MapPin size={16} />}
+                label="Геолокация"
+                onClick={sendLocation}
+              />
+              <MenuButton
+                icon={<ListChecks size={16} />}
+                label="Список задач"
+                onClick={() => {
+                  setMenuOpen(false);
+                  setTodoOpen(true);
+                }}
+              />
             </div>
           </>
         )}
@@ -1204,10 +1559,48 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
         <input
           ref={fileInputRef}
           type="file"
-          accept="image/*,video/*"
+          accept="image/*,video/*,.pdf,.doc,.docx,.zip,.rar,.7z,.txt,.md,.csv,.xls,.xlsx,.ppt,.pptx,.rtf,.odt"
           className="hidden"
           onChange={(e) => void onFilePicked(e)}
         />
+
+        {emojiOpen && !recording && (
+          <div className="mb-2 grid grid-cols-8 gap-1 rounded-lg border border-border bg-surface p-2">
+            {EMOJI_PANEL.map((emoji) => (
+              <button
+                key={emoji}
+                type="button"
+                onClick={() => {
+                  setText((value) => `${value}${emoji}`);
+                  textareaRef.current?.focus();
+                }}
+                className="rounded-md py-1 text-[20px] leading-none hover:bg-bg"
+                aria-label={`Эмодзи ${emoji}`}
+              >
+                {emoji}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {stickersOpen && !recording && (
+          <div className="mb-2 grid grid-cols-6 gap-1 rounded-lg border border-border bg-surface p-2">
+            {STICKERS.map((emoji) => (
+              <button
+                key={emoji}
+                type="button"
+                onClick={() => {
+                  setStickersOpen(false);
+                  void sendText(toSticker(emoji));
+                }}
+                className="rounded-md py-1 text-[24px] leading-none hover:bg-bg"
+                aria-label={`Стикер ${emoji}`}
+              >
+                {emoji}
+              </button>
+            ))}
+          </div>
+        )}
 
         {recording ? (
           <div className="flex items-center gap-3 px-1">
@@ -1233,6 +1626,40 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
             }}
             className="flex items-end gap-2"
           >
+            {isGroupChat && (
+              <button
+                type="button"
+                onClick={() => setPollOpen(true)}
+                className="rounded-lg p-2 text-text-muted hover:bg-surface hover:text-text"
+                aria-label="Создать опрос"
+              >
+                <BarChart3 size={18} />
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                setEmojiOpen((v) => !v);
+                setStickersOpen(false);
+              }}
+              className="rounded-lg p-2 text-text-muted hover:bg-surface hover:text-text"
+              aria-label="Эмодзи"
+              aria-pressed={emojiOpen}
+            >
+              <SmilePlus size={18} />
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setStickersOpen((v) => !v);
+                setEmojiOpen(false);
+              }}
+              className="rounded-lg p-2 text-text-muted hover:bg-surface hover:text-text"
+              aria-label="Стикеры"
+              aria-pressed={stickersOpen}
+            >
+              <Smile size={18} />
+            </button>
             <button
               type="button"
               onClick={() => setMenuOpen((v) => !v)}
@@ -1248,6 +1675,7 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
               onKeyDown={onKeyDown}
               placeholder={editing ? 'Изменить сообщение' : 'Сообщение'}
               rows={1}
+              maxLength={4000}
               className="max-h-32 min-h-[38px] min-w-0 flex-1 resize-none rounded-lg border border-border bg-bg px-3 py-2 text-[15px] text-text placeholder:text-text-muted focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
             />
             {text.trim() ? (
@@ -1276,6 +1704,139 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
           </form>
         )}
       </footer>
+
+      {todoOpen && (
+        <ModalOverlay onClose={() => setTodoOpen(false)}>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              const items = todoItems.map((item) => item.trim()).filter(Boolean);
+              if (items.length < 1) return;
+              setTodoOpen(false);
+              void sendText(encodeTodo(items));
+              setTodoItems(['', '']);
+            }}
+            className="flex flex-col gap-3"
+          >
+            <h2 className="text-[17px] font-medium text-text">Список задач</h2>
+            {todoItems.map((item, index) => (
+              <input
+                key={index}
+                value={item}
+                onChange={(e) =>
+                  setTodoItems((prev) =>
+                    prev.map((value, i) => (i === index ? e.target.value : value)),
+                  )
+                }
+                placeholder={`Задача ${index + 1}`}
+                maxLength={120}
+                className="rounded-lg border border-border bg-bg px-3 py-2 text-[15px] text-text"
+              />
+            ))}
+            {todoItems.length < 20 && (
+              <button
+                type="button"
+                onClick={() => setTodoItems((prev) => [...prev, ''])}
+                className="self-start text-[13px] text-accent hover:underline"
+              >
+                + Добавить задачу
+              </button>
+            )}
+            <div className="mt-1 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setTodoOpen(false)}
+                className="rounded-lg border border-border px-3 py-2 text-[14px] text-text-muted hover:text-text"
+              >
+                Отмена
+              </button>
+              <button
+                type="submit"
+                disabled={todoItems.every((item) => !item.trim())}
+                className="rounded-lg bg-accent px-3 py-2 text-[14px] font-medium text-white disabled:opacity-50"
+              >
+                Отправить
+              </button>
+            </div>
+          </form>
+        </ModalOverlay>
+      )}
+
+      {pollOpen && (
+        <ModalOverlay onClose={() => setPollOpen(false)}>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              const options = pollOptions.map((option) => option.trim()).filter(Boolean);
+              if (!pollQ.trim() || options.length < 2) return;
+              setPollOpen(false);
+              void sendText(encodePoll({ q: pollQ.trim(), options }));
+              setPollQ('');
+              setPollOptions(['', '']);
+            }}
+            className="flex flex-col gap-3"
+          >
+            <h2 className="text-[17px] font-medium text-text">Новый опрос</h2>
+            <input
+              value={pollQ}
+              onChange={(e) => setPollQ(e.target.value)}
+              placeholder="Вопрос"
+              maxLength={200}
+              className="rounded-lg border border-border bg-bg px-3 py-2 text-[15px] text-text"
+            />
+            {pollOptions.map((option, index) => (
+              <input
+                key={index}
+                value={option}
+                onChange={(e) =>
+                  setPollOptions((prev) => prev.map((value, i) => (i === index ? e.target.value : value)))
+                }
+                placeholder={`Вариант ${index + 1}`}
+                maxLength={80}
+                className="rounded-lg border border-border bg-bg px-3 py-2 text-[15px] text-text"
+              />
+            ))}
+            {pollOptions.length < 6 && (
+              <button
+                type="button"
+                onClick={() => setPollOptions((prev) => [...prev, ''])}
+                className="self-start text-[13px] text-accent hover:underline"
+              >
+                + Добавить вариант
+              </button>
+            )}
+            <div className="mt-1 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setPollOpen(false)}
+                className="rounded-lg border border-border px-3 py-2 text-[14px] text-text-muted hover:text-text"
+              >
+                Отмена
+              </button>
+              <button
+                type="submit"
+                disabled={!pollQ.trim() || pollOptions.filter((o) => o.trim()).length < 2}
+                className="rounded-lg bg-accent px-3 py-2 text-[14px] font-medium text-white disabled:opacity-50"
+              >
+                Отправить
+              </button>
+            </div>
+          </form>
+        </ModalOverlay>
+      )}
+
+      {forwardMsg && myId && (
+        <ForwardModal myId={myId} msg={forwardMsg} onClose={() => setForwardMsg(null)} />
+      )}
+
+      {peer && myId && (
+        <CallOverlay
+          chatId={chatId}
+          myId={myId}
+          peer={peer}
+          request={callRequest}
+        />
+      )}
 
       {photoOpen && (
         <PhotoCaptureModal
@@ -1334,10 +1895,41 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
             Date.now() - actionMsg.createdAt <= 15 * 60 * 1000
           }
           onReply={() => startReply()}
+          onQuickReply={(text) => {
+            if (!actionMsg) return;
+            const target = actionMsg;
+            setActionMsg(null);
+            setReplyTo(target);
+            void sendText(text);
+          }}
+          pinned={pinnedId === actionMsg.id}
+          onPin={() => {
+            const next = pinnedId === actionMsg.id ? null : actionMsg.id;
+            setPinnedId(next);
+            savePinnedId(chatId, next);
+            setActionMsg(null);
+          }}
+          onReact={(emoji) => {
+            toggleReaction(actionMsg.id, emoji);
+            setReactionTick((value) => value + 1);
+            setActionMsg(null);
+          }}
+          onForward={() => {
+            setForwardMsg(actionMsg);
+            setActionMsg(null);
+          }}
           onEdit={() => void startEdit()}
           onDelete={() => void deleteMessage()}
           onDeleteForAll={() => void deleteMessageForAll()}
           onSave={() => void saveToFavorites()}
+          onReport={() => {
+            if (!actionMsg || !myId) return;
+            const msg = actionMsg;
+            setActionMsg(null);
+            void db
+              .logAudit(myId, 'Жалоба на сообщение', 'message', msg.id, `chat=${msg.chatId}`)
+              .then(() => alert('Жалоба отправлена администратору'));
+          }}
           onClose={() => setActionMsg(null)}
         />
       )}
@@ -1365,3 +1957,4 @@ function MenuButton({
     </button>
   );
 }
+

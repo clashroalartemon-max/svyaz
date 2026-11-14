@@ -10,11 +10,13 @@
  */
 
 import * as storage from './storage';
-import { supabase, setSupabaseUser } from './supabase';
+import { supabase, setSupabaseUser, setSessionToken } from './supabase';
 import { emit } from './bus';
+import { safeError } from './logging';
 import { autoAssignRankForGroup } from './ranks';
 import { broadcastChat, broadcastMessage, sendTyping } from './realtime';
 import {
+  clearPrivateKey,
   decryptEnvelope,
   decryptEnvelopeToString,
   decryptGroupEnvelope,
@@ -134,6 +136,8 @@ interface ProfileRow {
   avatar_url: string | null;
   department: string | null;
   phone: string | null;
+  status: string | null;
+  bio: string | null;
   created_at: number | string;
 }
 
@@ -155,35 +159,33 @@ function rowToUser(row: ProfileRow): User {
     username: row.username ?? undefined,
     department: row.department ?? undefined,
     phone: row.phone ?? undefined,
+    status: row.status ?? undefined,
+    bio: row.bio ?? undefined,
     publicKeyJwk: row.public_key_jwk ?? {},
     avatarUrl: row.avatar_url ?? undefined,
     createdAt: Number(row.created_at ?? 0),
   };
 }
 
-const PROFILE_FIELDS =
-  'id,login,full_name,group_name,role,military_rank,position,role_level,username,public_key_jwk,encrypted_private_key,avatar_url,department,phone,created_at';
-
 /**
- * SELECT-поля для логина без приватного ключа собеседников: encrypted_private_key
- * и public_key_jwk нужны только для собственного профиля при входе, раздавать их
- * всем нельзя (это закрытые данные). Используется там, где профиль отдаётся
- * другим пользователям (поиск, список чатов).
+ * SELECT-поля публичного профиля. Зашифрованный приватный ключ сюда не входит:
+ * колонка закрыта на уровне прав, а сам ключ выдаётся только функции входа.
  */
 const PROFILE_PUBLIC_FIELDS =
+  'id,login,full_name,group_name,role,military_rank,position,role_level,username,public_key_jwk,avatar_url,department,phone,status,bio,created_at';
+
+// Поля без status/bio: схема может быть обновлена не полностью.
+const PROFILE_EXTRAS_PUBLIC_FIELDS =
   'id,login,full_name,group_name,role,military_rank,position,role_level,username,public_key_jwk,avatar_url,department,phone,created_at';
 
 // Резервный набор полей: живая база может быть ещё без новых колонок
 // (department/phone). Тогда приложение продолжает работать, а новые
 // возможности включаются после применения schema.sql.
-const PROFILE_BASE_FIELDS =
-  'id,login,full_name,group_name,role,military_rank,position,role_level,username,public_key_jwk,encrypted_private_key,avatar_url,created_at';
 const PROFILE_BASE_PUBLIC_FIELDS =
   'id,login,full_name,group_name,role,military_rank,position,role_level,username,public_key_jwk,avatar_url,created_at';
 
 /** Поддерживает ли живая база новые колонки профиля (department, phone). */
 let profileExtrasSupported: boolean | null = null;
-
 async function ensureProfileExtras(): Promise<boolean> {
   if (profileExtrasSupported !== null) return profileExtrasSupported;
   try {
@@ -195,25 +197,81 @@ async function ensureProfileExtras(): Promise<boolean> {
   return profileExtrasSupported;
 }
 
+/** Статус и био включаются флагом схемы, чтобы не ловить 400 на старых базах. */
+let profileSocialSupported: boolean | null = null;
+async function ensureProfileSocial(): Promise<boolean> {
+  if (profileSocialSupported !== null) return profileSocialSupported;
+  profileSocialSupported = await hasFeature('profile_social');
+  return profileSocialSupported;
+}
+
+/**
+ * Возможности схемы (`app_settings.schema_features`). Позволяет не вызывать
+ * ещё не установленные RPC: иначе в консоли появлялись бы 404, а операции
+ * падали бы в резервный путь с лишней задержкой.
+ */
+let schemaFeaturesCache: string | null = null;
+
+async function schemaFeatures(): Promise<string> {
+  if (schemaFeaturesCache !== null) return schemaFeaturesCache;
+  try {
+    const rows = (await unwrap(
+      supabase().from('app_settings').select('value').eq('key', 'schema_features').limit(1),
+    )) as { value: string }[];
+    schemaFeaturesCache = (rows ?? [])[0]?.value ?? '';
+  } catch {
+    schemaFeaturesCache = '';
+  }
+  return schemaFeaturesCache;
+}
+
+async function hasFeature(name: string): Promise<boolean> {
+  const list = (await schemaFeatures()).split(',').map((s) => s.trim());
+  return list.includes(name);
+}
+
+/**
+ * Выдать серверный токен после проверки пароля. Пока обновлённая схема не
+ * применена, вход работает по старому заголовку; после применения
+ * x-user-id больше не принимается.
+ */
+async function startSession(login: string, passwordHash: string): Promise<void> {
+  if (!(await hasFeature('auth_tokens'))) return;
+  try {
+    const token = await unwrap<string>(
+      supabase().rpc('issue_session_token', {
+        p_login: login,
+        p_hash: passwordHash,
+      }),
+    );
+    if (!token) throw new Error('пустой токен');
+    setSessionToken(token);
+  } catch (error) {
+    console.warn('Не удалось выдать сессионный токен', safeError(error));
+    throw new Error('Не удалось создать защищённую сессию. Повторите вход.');
+  }
+}
+
 /** Убрать из строки профиля новые колонки, если их нет в базе. */
 function profileRowForWrite(row: Record<string, unknown>): Record<string, unknown> {
+  const copy = { ...row };
   if (profileExtrasSupported === false) {
-    const copy = { ...row };
     delete copy.department;
     delete copy.phone;
-    return copy;
   }
-  return row;
+  if (profileSocialSupported !== true) {
+    delete copy.status;
+    delete copy.bio;
+  }
+  return copy;
 }
 
 /** Поля публичного профиля с учётом фактической схемы базы. */
 async function publicProfileFields(): Promise<string> {
-  return (await ensureProfileExtras()) ? PROFILE_PUBLIC_FIELDS : PROFILE_BASE_PUBLIC_FIELDS;
-}
-
-/** Поля полного профиля (с приватным ключом) с учётом схемы базы. */
-async function fullProfileFields(): Promise<string> {
-  return (await ensureProfileExtras()) ? PROFILE_FIELDS : PROFILE_BASE_FIELDS;
+  const extras = await ensureProfileExtras();
+  const social = await ensureProfileSocial();
+  if (social) return PROFILE_PUBLIC_FIELDS;
+  return extras ? PROFILE_EXTRAS_PUBLIC_FIELDS : PROFILE_BASE_PUBLIC_FIELDS;
 }
 
 export interface NewUserInput {
@@ -258,6 +316,8 @@ async function prepareProfile(input: NewUserInput): Promise<PreparedProfile> {
       avatar_url: null,
       department: null,
       phone: null,
+      status: null,
+      bio: null,
       created_at: Date.now(),
     },
     passwordHash: await hashPassword(login, input.password),
@@ -270,11 +330,12 @@ async function prepareProfile(input: NewUserInput): Promise<PreparedProfile> {
 export async function createUser(input: NewUserInput): Promise<User> {
   const { profile, passwordHash } = await prepareProfile(input);
   await ensureProfileExtras();
+  await ensureProfileSocial();
   const data = await unwrap<ProfileRow>(
     supabase()
       .from('profiles')
       .insert(profileRowForWrite(profile as unknown as Record<string, unknown>))
-      .select(await fullProfileFields())
+      .select(await publicProfileFields())
       .single(),
   );
   const { error } = await supabase()
@@ -310,13 +371,14 @@ export async function createUsersBatch(
 
   const inserted: ProfileRow[] = [];
   await ensureProfileExtras();
-  const fullFields = await fullProfileFields();
+  await ensureProfileSocial();
+  const publicFields = await publicProfileFields();
   for (let i = 0; i < rows.length; i += 100) {
     const chunk = rows
       .slice(i, i + 100)
       .map((r) => profileRowForWrite(r.profile as unknown as Record<string, unknown>));
     const data = await unwrap<ProfileRow[]>(
-      supabase().from('profiles').insert(chunk).select(fullFields),
+      supabase().from('profiles').insert(chunk).select(publicFields),
     );
     inserted.push(...(data ?? []));
   }
@@ -506,6 +568,7 @@ export async function verifyLogin(login: string, password: string): Promise<User
   if (!row) return null;
 
   const user = rowToUser(row);
+  await startSession(normalized, hash);
 
   // Переносимость ключа: если в базе есть зашифрованный приватный ключ —
   // расшифровываем его текущим паролем и кладём в localStorage.
@@ -537,7 +600,7 @@ export async function verifyLogin(login: string, password: string): Promise<User
     } catch (error) {
       // Ключ не совпал с паролем — это отдельный сбой; продолжаем вход с
       // публичным ключом (часть сообщений может не расшифроваться).
-      console.warn('Не удалось восстановить приватный ключ при входе', error);
+      console.warn('Не удалось восстановить приватный ключ при входе', safeError(error));
     }
   }
 
@@ -587,6 +650,10 @@ export async function changePassword(
   );
   if (!ok) throw new Error('Текущий пароль неверен');
 
+  // change_password стирает старые токены — выдаём новый до записи ключа,
+  // иначе обновление профиля ниже уже не пройдёт RLS.
+  await startSession(user.login, nextHash);
+
   // Перешифровываем приватный ключ новым паролем, если он зашифрован в базе.
   await reencryptPrivateKeyForUser(userId, user.login, currentPassword, newPassword);
 }
@@ -606,16 +673,34 @@ async function reencryptPrivateKeyForUser(
 
   let privateJwk = getPrivateKey(userId);
   if (!privateJwk) {
-    // Пытаемся восстановить из базы старым паролем.
+    // Восстанавливаем зашифрованный ключ старым паролем. Основной путь —
+    // RPC get_encrypted_key (колонка закрыта на чтение); если функции ещё
+    // нет в базе, откатываемся на прямое чтение для совместимости.
     try {
-      const full = (await unwrap<ProfileRow[]>(
-        supabase()
-          .from('profiles')
-          .select('encrypted_private_key')
-          .eq('id', userId)
-          .limit(1),
-      )) as ProfileRow[];
-      const encrypted = (full ?? [])[0]?.encrypted_private_key;
+      const currentHash = await hashPassword(login, currentPassword);
+      let encrypted: string | null = null;
+      if (await hasFeature('rpc_key')) {
+        try {
+          encrypted = await unwrap<string | null>(
+            supabase().rpc('get_encrypted_key', {
+              p_profile: userId,
+              p_hash: currentHash,
+            }),
+          );
+        } catch {
+          encrypted = null;
+        }
+      }
+      if (!encrypted) {
+        const full = (await unwrap<ProfileRow[]>(
+          supabase()
+            .from('profiles')
+            .select('encrypted_private_key')
+            .eq('id', userId)
+            .limit(1),
+        )) as ProfileRow[];
+        encrypted = (full ?? [])[0]?.encrypted_private_key ?? null;
+      }
       if (encrypted) {
         privateJwk = await decryptPrivateKeyWithPassword(
           encrypted,
@@ -623,7 +708,7 @@ async function reencryptPrivateKeyForUser(
         );
       }
     } catch (error) {
-      console.warn('Не удалось расшифровать ключ при смене пароля', error);
+      console.warn('Не удалось расшифровать ключ при смене пароля', safeError(error));
       return;
     }
   }
@@ -641,7 +726,7 @@ async function reencryptPrivateKeyForUser(
     if (error) throw new Error(error.message);
     savePrivateKey(userId, privateJwk);
   } catch (error) {
-    console.warn('Не удалось перешифровать приватный ключ', error);
+    console.warn('Не удалось перешифровать приватный ключ', safeError(error));
   }
 }
 
@@ -815,7 +900,13 @@ export async function getOrCreateChat(a: string, b: string): Promise<Chat> {
   if (existing) return existing;
 
   const chatId = uid();
-  const row: ChatRow = { id: chatId, created_at: Date.now(), saved: false, owner_id: null, secret: false };
+  const row: ChatRow = {
+    id: chatId,
+    created_at: Date.now(),
+    saved: false,
+    owner_id: a,
+    secret: false,
+  };
 
   const { error: chatError } = await supabase().from('chats').insert(row);
   if (chatError) throw new Error(chatError.message);
@@ -1433,6 +1524,18 @@ function writeQueued(items: QueuedMessage[]): void {
 }
 
 /**
+ * Отложенные сообщения из локальной очереди. Лента склеивает их с данными
+ * из базы, иначе очередное обновление списка «съедало» бы неотправленное
+ * сообщение и оно мигало бы при каждом событии.
+ */
+export function getQueuedMessages(chatId?: string): Message[] {
+  return readQueued()
+    .map((q) => q.msg)
+    .filter((m) => !chatId || m.chatId === chatId)
+    .sort((a, b) => a.createdAt - b.createdAt);
+}
+
+/**
  * Немедленно отправить сообщение в Supabase.
  * @returns true, если запись успешна; false при отсутствии сети.
  */
@@ -1453,6 +1556,10 @@ export async function saveMessageOptimistic(
   msg: Message,
   onError?: (error: unknown) => void,
 ): Promise<void> {
+  // Сразу помечаем сообщение «в очереди», если сети заведомо нет: в ленте
+  // появится часик, а не ложная галочка «отправлено».
+  if (!hasNetwork()) msg.status = 'queued';
+
   // 1. Мгновенно — в своё окно, без ожидания сети.
   emit('message:new', { chatId: msg.chatId, message: msg });
   emit('chat:updated', { chatId: msg.chatId });
@@ -1473,9 +1580,11 @@ export async function saveMessageOptimistic(
     written = false;
   }
   if (!written) {
+    msg.status = 'queued';
     const queued: QueuedMessage[] = readQueued();
     queued.push({ msg, queuedAt: Date.now() });
     writeQueued(queued);
+    emit('message:updated', { chatId: msg.chatId, messageId: msg.id });
   }
 }
 
@@ -1496,6 +1605,15 @@ export async function flushOfflineQueue(): Promise<number> {
         continue;
       }
       // Полная синхронизация: другие устройства и эта лента перечитают.
+      if (item.msg.status === 'queued') {
+        await supabase()
+          .from('messages')
+          .update({ status: 'sent' })
+          .eq('id', item.msg.id)
+          .then(({ error }) => {
+            if (error) console.warn('flush queue status', error.message);
+          });
+      }
       emit('message:updated', { chatId: item.msg.chatId, messageId: item.msg.id });
       sent += 1;
     } catch {
@@ -1527,7 +1645,9 @@ function messageToRow(msg: Message): Record<string, unknown> {
     duration: msg.duration === undefined ? null : Math.round(msg.duration),
     waveform: msg.waveform ?? null,
     reply_to_id: msg.replyToId ?? null,
-    status: msg.status ?? 'sent',
+    // «queued» — клиентский статус (офлайн-очередь). В базе допустимы только
+    // sent/delivered/read, поэтому при записи превращаем его в sent.
+    status: msg.status === 'queued' ? 'sent' : (msg.status ?? 'sent'),
     deleted_for: msg.deletedFor ?? [],
     storage_path: msg.storagePath ?? null,
     group_keys: msg.groupKeys ?? null,
@@ -1590,6 +1710,17 @@ export async function setMessageStatus(msgId: string, status: MessageStatus): Pr
 
 /** Все входящие в моих чатах: sent → delivered */
 export async function markMessagesDelivered(userId: string): Promise<void> {
+  if (await hasFeature('rpc_status')) {
+    try {
+      await unwrap(supabase().rpc('mark_delivered', { p_user: userId }));
+      emit('message:updated', {});
+      void broadcastMessage({ chatId: '', kind: 'updated' });
+      return;
+    } catch {
+      /* RPC объявлен, но недоступен — уходим в резервный путь */
+    }
+  }
+
   const parts = (await unwrap(
     supabase().from('chat_participants').select('chat_id').eq('user_id', userId),
   )) as { chat_id: string }[];
@@ -1608,6 +1739,19 @@ export async function markMessagesDelivered(userId: string): Promise<void> {
 }
 
 export async function markChatRead(chatId: string, userId: string): Promise<void> {
+  if (await hasFeature('rpc_status')) {
+    try {
+      await unwrap(
+        supabase().rpc('mark_chat_read', { p_chat: chatId, p_user: userId }),
+      );
+      emit('message:updated', { chatId });
+      void broadcastMessage({ chatId, kind: 'updated' });
+      return;
+    } catch {
+      /* резервный путь ниже */
+    }
+  }
+
   const { error } = await supabase()
     .from('messages')
     .update({ status: 'read' })
@@ -1639,12 +1783,23 @@ export async function markChatRead(chatId: string, userId: string): Promise<void
  * собеседник видит сообщение в обычном виде.
  */
 export async function softDeleteMessage(msg: Message, userId: string): Promise<void> {
-  const deletedFor = Array.from(new Set([...(msg.deletedFor ?? []), userId]));
-  const { error } = await supabase()
-    .from('messages')
-    .update({ deleted_for: deletedFor })
-    .eq('id', msg.id);
-  if (error) throw new Error(error.message);
+  let done = false;
+  if (await hasFeature('rpc_hide')) {
+    try {
+      await unwrap(supabase().rpc('hide_message', { p_msg: msg.id, p_user: userId }));
+      done = true;
+    } catch {
+      done = false;
+    }
+  }
+  if (!done) {
+    const deletedFor = Array.from(new Set([...(msg.deletedFor ?? []), userId]));
+    const { error } = await supabase()
+      .from('messages')
+      .update({ deleted_for: deletedFor })
+      .eq('id', msg.id);
+    if (error) throw new Error(error.message);
+  }
   emit('message:updated', { messageId: msg.id, chatId: msg.chatId });
   void broadcastMessage({ chatId: msg.chatId, messageId: msg.id, kind: 'updated' });
 }
@@ -1666,14 +1821,32 @@ export async function deleteMessageForAll(msg: Message, userId: string): Promise
   void broadcastMessage({ chatId: msg.chatId, messageId: msg.id, kind: 'updated' });
 }
 
-/** Полная очистка истории чата */
+/** Скрыть историю чата ТОЛЬКО у себя (у собеседников сообщения остаются). */
 export async function clearChatHistory(chatId: string, userId: string): Promise<void> {
-  await supabase().from('media').delete().in(
-    'msg_id',
-    ((await getMessages(chatId)) ?? []).map((m) => m.id),
-  );
-  await supabase().from('messages').delete().eq('chat_id', chatId);
-  await supabase().from('read_state').delete().eq('chat_id', chatId).eq('user_id', userId);
+  let done = false;
+  if (await hasFeature('rpc_hide')) {
+    try {
+      await unwrap(supabase().rpc('hide_chat', { p_chat: chatId, p_user: userId }));
+      done = true;
+    } catch {
+      done = false;
+    }
+  }
+  if (!done) {
+    // Совместимость со старой базой: помечаем сообщения по одному,
+    // ничего не удаляя у других участников и не трогая медиа.
+    const list = await getMessages(chatId);
+    for (const m of list) {
+      if ((m.deletedFor ?? []).includes(userId)) continue;
+      const deletedFor = [...(m.deletedFor ?? []), userId];
+      await supabase().from('messages').update({ deleted_for: deletedFor }).eq('id', m.id);
+    }
+    await supabase()
+      .from('read_state')
+      .delete()
+      .eq('chat_id', chatId)
+      .eq('user_id', userId);
+  }
   emit('chat:cleared', { chatId });
   emit('chat:updated', { chatId });
   void broadcastMessage({ chatId, kind: 'updated' });
@@ -2076,7 +2249,7 @@ export async function readMessageText(msg: Message, userId: string): Promise<str
       });
       return new TextDecoder().decode(bytes);
     } catch (err) {
-      console.warn('readMessageText group decrypt failed', err);
+      console.warn('readMessageText group decrypt failed', safeError(err));
       return null;
     }
   }
@@ -2212,6 +2385,51 @@ export async function isUserOnline(userId: string): Promise<boolean> {
   return Date.now() - Number(row.last_seen ?? 0) < 20000;
 }
 
+/** Последний визит и разрешение показывать его другим. */
+export async function getPresence(
+  userId: string,
+): Promise<{ lastSeen: number; showLastSeen: boolean } | null> {
+  try {
+    const rows = (await unwrap(
+      supabase()
+        .from('presence')
+        .select('last_seen,show_last_seen')
+        .eq('user_id', userId)
+        .limit(1),
+    )) as { last_seen: number | string; show_last_seen?: boolean }[];
+    const row = (rows ?? [])[0];
+    if (!row) return null;
+    return { lastSeen: Number(row.last_seen ?? 0), showLastSeen: row.show_last_seen !== false };
+  } catch {
+    // Старая схема без show_last_seen: считаем, что показывать разрешено.
+    try {
+      const rows = (await unwrap(
+        supabase().from('presence').select('last_seen').eq('user_id', userId).limit(1),
+      )) as { last_seen: number | string }[];
+      const row = (rows ?? [])[0];
+      if (!row) return null;
+      return { lastSeen: Number(row.last_seen ?? 0), showLastSeen: true };
+    } catch {
+      return null;
+    }
+  }
+}
+
+/** Сохранить настройку «показывать время последнего визита». */
+export async function setLastSeenVisible(userId: string, visible: boolean): Promise<boolean> {
+  const { error } = await supabase()
+    .from('presence')
+    .upsert(
+      { user_id: userId, last_seen: Date.now(), show_last_seen: visible },
+      { onConflict: 'user_id' },
+    );
+  if (error) {
+    console.warn('last seen visibility update failed', error.message);
+    return false;
+  }
+  return true;
+}
+
 // --- сессия и тема -------------------------------------------------------------
 
 export function getCurrentUserId(): string | null {
@@ -2226,10 +2444,36 @@ export function setCurrentUserId(id: string): void {
 
 /** Выход: чистим ТОЛЬКО сессию. Ключи и историю не удаляем. */
 export function logout(): void {
+  const uid = getCurrentUserId();
+  const token = storage.getSessionToken();
+  if (token) {
+    try {
+      void supabase().rpc('revoke_session_token', { p_token: token });
+    } catch {
+      /* старая база без RPC — токена там всё равно нет */
+    }
+    setSessionToken(null);
+  }
+  // Безопасность: при выходе убираем с устройства приватный ключ E2EE,
+  // кэш сообщений и неотправленную очередь — следующий пользователь
+  // за этим компьютером не получит доступ к переписке.
+  if (uid) clearPrivateKey(uid);
   storage.setCurrentUserId(null);
   clearLocalMessageCache();
+  writeQueued([]);
   setSupabaseUser(null);
   emit('auth:changed', null);
+}
+
+/**
+ * После обновления схемы старые сессии (без токена) недействительны:
+ * если токена нет, а пользователь сохранён — разлогиниваемся, чтобы человек
+ * вошёл заново и получил подписанную сессию.
+ */
+export async function ensureSessionToken(): Promise<void> {
+  if (!(await hasFeature('auth_tokens'))) return;
+  if (storage.getSessionToken()) return;
+  if (storage.getCurrentUserId()) logout();
 }
 
 /**
@@ -2345,6 +2589,41 @@ export async function setMyUsername(username: string): Promise<void> {
   if (!ok) throw new Error('Этот ник уже занят');
 }
 
+/** Статус и «О себе» текущего пользователя. */
+export async function updateMyProfile(patch: {
+  status?: string;
+  bio?: string;
+}): Promise<void> {
+  if (!(await ensureProfileSocial())) {
+    throw new Error('Статусы появятся после обновления схемы (profile_social)');
+  }
+  const id = storage.getCurrentUserId();
+  if (!id) throw new Error('Нет активной сессии');
+  const row: Record<string, unknown> = {};
+  if (patch.status !== undefined) row.status = patch.status.trim() || null;
+  if (patch.bio !== undefined) row.bio = patch.bio.trim() || null;
+  if (Object.keys(row).length === 0) return;
+  const { error } = await supabase().from('profiles').update(row).eq('id', id);
+  if (error) throw new Error(error.message);
+  emit('profile:updated', { userId: id });
+}
+
+/** Кто прочитал чат: last_read_at по каждому участнику (RLS — только свои чаты). */
+export async function getChatReaders(
+  chatId: string,
+): Promise<Array<{ userId: string; lastReadAt: number }>> {
+  const rows = (await unwrap(
+    supabase()
+      .from('read_state')
+      .select('user_id,last_read_at')
+      .eq('chat_id', chatId),
+  )) as Array<{ user_id: string; last_read_at: number | string }>;
+  return (rows ?? []).map((row) => ({
+    userId: row.user_id,
+    lastReadAt: Number(row.last_read_at ?? 0),
+  }));
+}
+
 /** Полное удаление пользователя и всех его данных (только админ) */
 export async function adminDeleteUser(userId: string): Promise<void> {
   const ok = await unwrap<boolean>(supabase().rpc('admin_delete_user', { p_profile: userId }));
@@ -2453,8 +2732,7 @@ export async function logAudit(
   }
 }
 
-/** Журнал действий с фильтрами (админ). */
-export async function getAuditLog(filters: {
+/** Журнал действий с фильтрами (админ). */export async function getAuditLog(filters: {
   actor?: string;
   action?: string;
   from?: number;
@@ -2490,6 +2768,22 @@ export async function getAuditLog(filters: {
     details: r.details,
     createdAt: Number(r.created_at ?? 0),
   }));
+}
+
+/** Резервная копия доступных админу данных (без E2EE-сообщений). */
+export async function exportBackup(): Promise<Record<string, unknown>> {
+  const [users, departments, audit] = await Promise.all([
+    getAllUsers(),
+    getDepartments(),
+    getAuditLog({ limit: 1000 }),
+  ]);
+  return {
+    exportedAt: new Date().toISOString(),
+    users,
+    departments,
+    audit,
+    note: 'Сообщения и файлы не включены: они зашифрованы на устройствах пользователей.',
+  };
 }
 
 export interface AdminStats {
@@ -2676,7 +2970,34 @@ async function ensureChatsPinned(): Promise<boolean> {
 export async function adminDeleteChat(chatId: string): Promise<void> {
   const { error } = await supabase().from('chats').delete().eq('id', chatId);
   if (error) throw new Error(error.message);
-  emit('chat:updated', { chatId });
+}
+
+/** Объединить дубли авточатов (SQL-функция admin_merge_duplicate_chats). */
+export async function adminMergeDuplicateChats(): Promise<number> {
+  if (!(await hasFeature('merge_chats'))) {
+    throw new Error('Функция объединения не установлена — выполните schema.sql');
+  }
+  const data = await unwrap(supabase().rpc('admin_merge_duplicate_chats'));
+  return Number(data ?? 0);
+}
+
+export interface AdminActivityPoint {
+  day: string;
+  count: number;
+}
+
+/** Активность сообщений по дням (по умолчанию 30 дней). */
+export async function getAdminActivity(days = 30): Promise<AdminActivityPoint[]> {
+  // Не дёргаем отсутствующую функцию: иначе в консоли будет 404, пока
+  // обновлённый schema.sql не выполнен. Наличие фичи отмечается в app_settings.
+  if (!(await hasFeature('admin_activity'))) {
+    throw new Error('Функция графика ещё не установлена (выполните schema.sql)');
+  }
+
+  const rows = (await unwrap(
+    supabase().rpc('admin_activity', { p_days: days }),
+  )) as Array<{ day: string; count: number | string }>;
+  return (rows ?? []).map((r) => ({ day: r.day, count: Number(r.count ?? 0) }));
 }
 
 /** Закрепить / открепить чат. */
@@ -2767,6 +3088,8 @@ export async function adminUpdateBroadcastText(id: string, text: string): Promis
 export interface AppSettings {
   registrationEnabled: boolean;
   chatsDisabled: boolean;
+  /** технический режим: диагностические подписи для администратора */
+  techMode: boolean;
   mainAdminId: string;
 }
 
@@ -2779,6 +3102,7 @@ export async function getAppSettings(): Promise<AppSettings> {
   return {
     registrationEnabled: map.get('registration_enabled') === 'true',
     chatsDisabled: map.get('chats_disabled') === 'true',
+    techMode: map.get('tech_mode') === 'true',
     mainAdminId: map.get('main_admin_id') ?? '',
   };
 }

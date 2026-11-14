@@ -11,6 +11,8 @@
 
 import { createClient } from '@supabase/supabase-js';
 import type { SupabaseClient } from '@supabase/supabase-js';
+import * as storage from './storage';
+import { buildAuthHeaders } from './session';
 
 const URL = import.meta.env.VITE_SUPABASE_URL ?? '';
 const ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY ?? '';
@@ -24,7 +26,7 @@ export const SUPABASE_SETUP_HINT =
 function build(userId: string): SupabaseClient {
   return createClient(URL, ANON_KEY, {
     auth: { persistSession: false, autoRefreshToken: false },
-    global: { headers: userId ? { 'x-user-id': userId } : {} },
+    global: { headers: buildAuthHeaders(userId, storage.getSessionToken()) },
   });
 }
 
@@ -48,4 +50,13 @@ export function setSupabaseUser(userId: string | null): void {
   if (id === clientUserId && client) return;
   clientUserId = id;
   client = isSupabaseConfigured ? build(id) : null;
+}
+
+/** Сохранить токен и пересоздать клиент с новым заголовком. */
+export function setSessionToken(token: string | null): void {
+  storage.setSessionToken(token);
+  const id = clientUserId;
+  clientUserId = '';
+  client = null;
+  setSupabaseUser(id || null);
 }

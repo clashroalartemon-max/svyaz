@@ -1,6 +1,6 @@
-import { Component, useCallback, useEffect, useState } from 'react';
+import { Component, lazy, Suspense, useCallback, useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
+import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { seedIfNeeded } from './lib/seed';
 import * as db from './lib/db';
 import { getCryptoBackend } from './lib/crypto';
@@ -9,13 +9,36 @@ import { bindRealtimeToAuth, startRealtime } from './lib/realtime';
 import { useApplyTheme, useAuth, useCurrentUser, usePresenceHeartbeat } from './hooks';
 import { LoginPage } from './pages/LoginPage';
 import { MainPage } from './pages/MainPage';
-import { SearchPage } from './pages/SearchPage';
-import { SettingsPage } from './pages/SettingsPage';
-import { ContactsPage } from './pages/ContactsPage';
 import { ChatPage } from './pages/ChatPage';
-import { AdminPage } from './pages/AdminPage';
-import { ProfilePage } from './pages/ProfilePage';
-import { StructurePage } from './pages/StructurePage';
+import { BottomNav } from './components/BottomNav';
+
+// Тяжёлые экраны грузим отдельными чанками: стартовый бандл остаётся лёгким.
+const SearchPage = lazy(() =>
+  import('./pages/SearchPage').then((m) => ({ default: m.SearchPage })),
+);
+const SettingsPage = lazy(() =>
+  import('./pages/SettingsPage').then((m) => ({ default: m.SettingsPage })),
+);
+const ContactsPage = lazy(() =>
+  import('./pages/ContactsPage').then((m) => ({ default: m.ContactsPage })),
+);
+const AdminPage = lazy(() =>
+  import('./pages/AdminPage').then((m) => ({ default: m.AdminPage })),
+);
+const ProfilePage = lazy(() =>
+  import('./pages/ProfilePage').then((m) => ({ default: m.ProfilePage })),
+);
+const StructurePage = lazy(() =>
+  import('./pages/StructurePage').then((m) => ({ default: m.StructurePage })),
+);
+
+function PageFallback() {
+  return (
+    <div className="flex h-full items-center justify-center text-[13px] text-text-muted">
+      Загрузка…
+    </div>
+  );
+}
 
 function RequireAuth({ children }: { children: ReactNode }) {
   const userId = useAuth();
@@ -88,6 +111,9 @@ const HIDE_CRYPTO_NOTICE_KEY = 'svyaz.hideCryptoNotice';
 
 /** Понятная подсказка вместо технического текста Supabase */
 function initHint(message: string): string | null {
+  if (/permission denied for table|permission denied for relation/i.test(message)) {
+    return 'Выполните supabase/fix_permissions.sql в Supabase → SQL Editor: он выдаёт гранты и включает бакет avatars.';
+  }
   if (/Could not find the table|PGRST205|schema cache/i.test(message)) {
     return 'Выполните supabase/schema.sql в Supabase → SQL Editor и перезагрузите страницу.';
   }
@@ -131,7 +157,14 @@ function startInit(onProgress: (label: string) => void): Promise<void> {
     onProgress('Проверка ключей шифрования…');
     await db.repairAllUserKeys();
     const uid = db.getCurrentUserId();
-    if (uid) await db.ensureUserKeyPair(uid);
+    if (uid) {
+      await db.ensureUserKeyPair(uid);
+      // На новом устройстве участие в авточатах могло не создаться —
+      // восстанавливаем его, чтобы список чатов не был пустым.
+      await db.ensureAutoChats(uid).catch((error: unknown) => {
+        console.warn('ensureAutoChats on init failed', error);
+      });
+    }
     // Подписка на новые сообщения (Supabase Realtime)
     startRealtime();
   })().catch((error: unknown) => {
@@ -143,8 +176,44 @@ function startInit(onProgress: (label: string) => void): Promise<void> {
   return initPromise;
 }
 
+/** Глобальные горячие клавиши: Ctrl/Cmd+K — поиск сотрудников. */
+function GlobalHotkeys() {
+  const navigate = useNavigate();
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        navigate('/search');
+        window.setTimeout(() => {
+          const input = document.querySelector<HTMLInputElement>('input');
+          input?.focus();
+        }, 60);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [navigate]);
+  return null;
+}
+
+/** Плавная смена экранов: лёгкий fade + подъём при смене маршрута. */
+function PageTransition({ children }: { children: ReactNode }) {
+  const location = useLocation();
+  return (
+    <div key={location.pathname} className="page-enter h-full">
+      {children}
+    </div>
+  );
+}
+
 export function App() {
   useApplyTheme();
+
+  // После перехода на подписанные токены старые сессии без токена
+  // недействительны — заставляем войти заново.
+  useEffect(() => {
+    void db.ensureSessionToken();
+  }, []);
 
   const [ready, setReady] = useState(false);
   const [progress, setProgress] = useState<string | null>(null);
@@ -253,7 +322,12 @@ export function App() {
       )}
       <div className="min-h-0 flex-1">
         <BrowserRouter>
-          <Routes>
+          <GlobalHotkeys />
+          <div className="flex h-full flex-col">
+            <div className="min-h-0 flex-1">
+              <PageTransition>
+                <Suspense fallback={<PageFallback />}>
+                  <Routes>
             <Route path="/login" element={<LoginPage />} />
             <Route
               path="/main"
@@ -322,7 +396,12 @@ export function App() {
               }
             />
             <Route path="*" element={<Navigate to="/main" replace />} />
-          </Routes>
+              </Routes>
+            </Suspense>
+          </PageTransition>
+            </div>
+            <BottomNav />
+          </div>
         </BrowserRouter>
       </div>
     </div>

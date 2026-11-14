@@ -1,10 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+﻿import { useEffect, useMemo, useRef, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import {
   Archive,
+  Bell,
   BookOpen,
   Building2,
   Check,
+  ChevronDown,
+  ChevronUp,
   GraduationCap,
   Megaphone,
   MessageSquarePlus,
@@ -12,10 +15,18 @@ import {
   Settings,
   Shield,
   Star,
+  User,
   Users,
 } from 'lucide-react';
 import * as db from '../lib/db';
-import { on } from '../lib/bus';
+import { emit, on } from '../lib/bus';
+import { playNotificationSound } from '../lib/sound';
+import { showMessageNotification } from '../lib/notifications';
+import { isIncognito } from '../lib/incognito';
+import { describeMessage } from '../lib/messageSummary';
+import { getContactName } from '../lib/contactNames';
+import { validateGroupTitle } from '../lib/validation';
+import { pluralParticipants } from '../lib/format';
 import { useAuth, useChats, useCurrentUser, useMediaQuery, useOnline } from '../hooks';
 import { Avatar, Badge, Button, Input, ThemeToggle } from '../ui';
 import { ModalOverlay } from '../components/chat-modals';
@@ -28,11 +39,15 @@ const TABS: Array<{ key: ChatTab; label: string; icon: typeof Users }> = [
   { key: 'all', label: 'Все', icon: Users },
   { key: 'squad', label: 'Взвод', icon: Users },
   { key: 'group', label: 'Группы', icon: MessageSquarePlus },
+  { key: 'direct', label: 'Личные', icon: User },
   { key: 'commander', label: 'Командиры', icon: Shield },
   { key: 'course', label: 'Курсовые', icon: GraduationCap },
   { key: 'teachers', label: 'Преподаватели', icon: BookOpen },
   { key: 'archive', label: 'Архив', icon: Archive },
 ];
+
+const PRIMARY_TABS = TABS.filter((tab) => ['all', 'direct', 'group'].includes(tab.key));
+const MORE_TABS = TABS.filter((tab) => !['all', 'direct', 'group'].includes(tab.key));
 
 /**
  * Папка чата. Групповые и системные чаты остаются в своей категории,
@@ -58,14 +73,6 @@ function chatFolder(item: ChatListItem): ChatKind {
 function fmtTime(ts: number): string {
   return new Date(ts).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
 }
-
-const TYPE_LABEL: Record<Message['type'], string> = {
-  text: '',
-  voice: '[Голосовое]',
-  photo: '[Фото]',
-  video: '[Видео]',
-  circle: '[Кружок]',
-};
 
 /** Короткий сигнал о новом сообщении через Web Audio API */
 function useNotificationSound(myId: string | null, activeChatId: string | null): void {
@@ -131,13 +138,13 @@ function LastMessagePreview({
     if (msg.type === 'text') {
       db.readMessageText(msg, myId)
         .then((t) => {
-          if (alive) setText(t ?? '[Не удалось расшифровать]');
+          if (alive) setText(describeMessage(msg, t));
         })
         .catch(() => {
-          if (alive) setText('[Не удалось расшифровать]');
+          if (alive) setText('Зашифровано старым ключом');
         });
     } else {
-      setText(TYPE_LABEL[msg.type]);
+      setText(describeMessage(msg, null));
     }
     return () => {
       alive = false;
@@ -156,21 +163,13 @@ function LastMessagePreview({
   );
 }
 
-/** Склонение слова «участник» для подписи группового чата */
-function pluralParticipants(n: number): string {
-  const mod10 = n % 10;
-  const mod100 = n % 100;
-  if (mod10 === 1 && mod100 !== 11) return 'участник';
-  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return 'участника';
-  return 'участников';
-}
-
 /** Строка списка чатов: онлайн-индикатор требует отдельного хука */
 function ChatRow({
   item,
   myId,
   active,
   archived,
+  incognito,
   onClick,
   onArchive,
 }: {
@@ -178,12 +177,13 @@ function ChatRow({
   myId: string;
   active: boolean;
   archived: boolean;
+  incognito: boolean;
   onClick: () => void;
   onArchive: () => void;
 }) {
   const { chat, peer, lastMessage, unread } = item;
   const online = useOnline(chat.saved ? null : peer.id);
-  const title = chat.saved ? 'Избранное' : peer.fullName;
+  const title = chat.saved ? 'Избранное' : getContactName(peer.id) ?? peer.fullName;
 
   // Групповые чаты: название уже в заголовке, поэтому снизу показываем
   // число участников, а не повторяем название ещё раз.
@@ -197,17 +197,18 @@ function ChatRow({
     ? 'Личные заметки'
     : isGroupChat
       ? `${participants} ${pluralParticipants(participants)}`
-      : peer.group;
+      : peer.status || peer.group;
 
   return (
     <button
       type="button"
+      data-chat-row
       onClick={onClick}
       onContextMenu={(e) => {
         e.preventDefault();
         onArchive();
       }}
-      className={`flex w-full items-center gap-3 border-b border-border px-4 py-3 text-left transition-colors hover:bg-surface ${
+      className={`flex w-full items-center gap-2.5 border-b border-border px-3 py-2.5 text-left transition-colors hover:bg-surface md:gap-3 md:px-4 md:py-3 ${
         active ? 'bg-surface' : ''
       }`}
       title={archived ? 'Нажмите правой кнопкой, чтобы разархивировать' : 'Правая кнопка — в архив'}
@@ -237,10 +238,12 @@ function ChatRow({
           )}
         </div>
         <div className="flex items-center justify-between gap-2">
-          <span className="truncate text-[13px] text-text-muted">{subtitle}</span>
+          {subtitle && subtitle !== title && (
+            <span className="truncate text-[12px] text-text-muted md:text-[13px]">{subtitle}</span>
+          )}
           {unread > 0 && <Badge count={unread} />}
         </div>
-        {lastMessage && (
+        {lastMessage && !incognito && (
           <div className="mt-0.5 flex items-center justify-between gap-2">
             <span className="min-w-0 flex-1">
               <LastMessagePreview
@@ -251,6 +254,9 @@ function ChatRow({
             </span>
           </div>
         )}
+        {lastMessage && incognito && (
+          <div className="mt-0.5 text-[12px] italic text-text-muted">Сообщения скрыты</div>
+        )}
       </div>
     </button>
   );
@@ -258,19 +264,24 @@ function ChatRow({
 
 export function MainPage({ initialChatId }: { initialChatId?: string } = {}) {
   const navigate = useNavigate();
+  const location = useLocation();
   const myId = useAuth();
   const me = useCurrentUser();
-  const chats = useChats(myId);
+  const { chats, loading: chatsLoading, error: chatsError } = useChats(myId);
   const isDesktop = useMediaQuery('(min-width: 900px)');
 
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(initialChatId ?? null);
   const [tab, setTab] = useState<ChatTab>('all');
+  const [moreTabsOpen, setMoreTabsOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [newChatOpen, setNewChatOpen] = useState(false);
   const [broadcastOpen, setBroadcastOpen] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [archivedIds, setArchivedIds] = useState<Set<string>>(new Set());
+  const [incognito, setIncognitoState] = useState(() => isIncognito());
+
+  useEffect(() => on('settings:changed', () => setIncognitoState(isIncognito())), []);
 
   // Загружаем список архивированных чатов и обновляем при изменениях
   useEffect(() => {
@@ -289,6 +300,29 @@ export function MainPage({ initialChatId }: { initialChatId?: string } = {}) {
     if (initialChatId) setSelectedId(initialChatId);
   }, [initialChatId]);
 
+  // Нижняя навигация ведёт на /main?panel=notifications
+  useEffect(() => {
+    const panel = new URLSearchParams(location.search).get('panel');
+    if (panel === 'notifications') setNotificationsOpen(true);
+  }, [location.search]);
+
+  // Кнопка «Создать» в нижней навигации открывает модалку нового чата.
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    if (params.get('new') !== '1') return;
+    setNewChatOpen(true);
+    navigate('/main', { replace: true });
+  }, [location.search, navigate]);
+
+  // Архив открывается из шторки «Ещё».
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    if (params.get('archive') !== '1') return;
+    setTab('archive');
+    setMoreTabsOpen(true);
+    navigate('/main', { replace: true });
+  }, [location.search, navigate]);
+
   useNotificationSound(myId, isDesktop ? selectedId : null);
 
   // системный чат «Избранное» + отметки о доставке + авточаты взвода (Ч.3)
@@ -301,10 +335,41 @@ export function MainPage({ initialChatId }: { initialChatId?: string } = {}) {
 
   useEffect(() => {
     if (!myId) return;
-    return on('message:new', () => {
+    return on('message:new', (payload) => {
       void db.markMessagesDelivered(myId);
+      const p = payload as { chatId?: string; senderId?: string } | undefined;
+      if (!p?.senderId || p.senderId === myId) return;
+      const openNow =
+        document.visibilityState === 'visible' && p.chatId === selectedId;
+      if (!openNow) {
+        playNotificationSound();
+        if (p.chatId) {
+          const item = chats.find((entry) => entry.chat.id === p.chatId);
+          const title = item
+            ? item.chat.saved
+              ? 'Избранное'
+              : item.peer.fullName
+            : 'Связь';
+          showMessageNotification(title, 'Новое сообщение', () => {
+            navigate(`/chat/${p.chatId}`);
+          });
+        }
+      }
     });
-  }, [myId]);
+  }, [myId, selectedId, chats, navigate]);
+
+  // Упоминание @login: звук и браузерное уведомление.
+  useEffect(() => {
+    if (!myId) return;
+    return on('mention:new', (payload) => {
+      const data = payload as { userIds?: string[]; from?: string; chatId?: string } | undefined;
+      if (!data?.userIds?.includes(myId) || data.from === myId) return;
+      playNotificationSound();
+      showMessageNotification('Вас упомянули', 'В чате есть упоминание', () => {
+        if (data.chatId) navigate(`/chat/${data.chatId}`);
+      });
+    });
+  }, [myId, navigate]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -324,6 +389,13 @@ export function MainPage({ initialChatId }: { initialChatId?: string } = {}) {
         c.peer.group.toLowerCase().includes(q),
     );
   }, [chats, query, tab, archivedIds]);
+
+  const visibleTabs = [
+    ...PRIMARY_TABS,
+    ...(moreTabsOpen
+      ? MORE_TABS
+      : MORE_TABS.filter((item) => item.key === tab)),
+  ];
 
   if (!me || !myId) {
     return (
@@ -360,52 +432,91 @@ export function MainPage({ initialChatId }: { initialChatId?: string } = {}) {
         isDesktop ? 'w-[340px] shrink-0' : 'w-full'
       }`}
     >
-      {/* шапка */}
-      <header className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-3">
+      {/* шапка: на телефоне только профиль и «новый чат», остальное — в нижней панели */}
+      <header className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2.5 md:gap-3 md:px-4 md:py-3">
         <Avatar name={me.fullName} size="md" seed={me.id} />
         <div className="min-w-0 flex-1">
           <div className="truncate text-[15px] font-medium text-text">{me.fullName}</div>
-          <div className="text-[13px] text-text-muted">{me.group}</div>
+          <div className="truncate text-[12px] text-text-muted md:text-[13px]">{me.group}</div>
         </div>
-        <ThemeToggle />
         <button
           type="button"
-          onClick={() => navigate('/structure')}
-          className="rounded-lg p-2 text-text-muted hover:bg-surface hover:text-text"
-          aria-label="Структура университета"
-          title="Структура университета"
+          onClick={() => setNotificationsOpen(true)}
+          className="rounded-lg p-2 text-text-muted hover:bg-surface hover:text-text min-[900px]:hidden"
+          aria-label="Оповещения"
         >
-          <Building2 size={18} />
+          <Bell size={18} />
         </button>
         <button
           type="button"
           onClick={() => navigate('/settings')}
-          className="rounded-lg p-2 text-text-muted hover:bg-surface hover:text-text"
+          className="rounded-lg p-2 text-text-muted hover:bg-surface hover:text-text min-[900px]:hidden"
           aria-label="Настройки"
         >
           <Settings size={18} />
         </button>
+        <div className="hidden items-center gap-1 min-[900px]:flex">
+          <ThemeToggle />
+          <button
+            type="button"
+            onClick={() => setNotificationsOpen(true)}
+            className="rounded-lg p-2 text-text-muted hover:bg-surface hover:text-text"
+            aria-label="Оповещения"
+          >
+            <Bell size={18} />
+          </button>
+          <button
+            type="button"
+            onClick={() => navigate('/structure')}
+            className="rounded-lg p-2 text-text-muted hover:bg-surface hover:text-text"
+            aria-label="Структура университета"
+            title="Структура университета"
+          >
+            <Building2 size={18} />
+          </button>
+          <button
+            type="button"
+            onClick={() => navigate('/settings')}
+            className="rounded-lg p-2 text-text-muted hover:bg-surface hover:text-text"
+            aria-label="Настройки"
+          >
+            <Settings size={18} />
+          </button>
+        </div>
       </header>
 
-      {/* вкладки: Взвод / Командиры / Курсовые / Преподаватели */}
-      <div className="flex shrink-0 gap-1 overflow-x-auto border-b border-border px-2 py-1.5">
-        {TABS.map(({ key, label, icon: Icon }) => {
-          const active = tab === key;
-          return (
-            <button
-              key={key}
-              type="button"
-              onClick={() => setTab(key)}
-              className={`flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-1.5 text-[13px] ${
-                active ? 'bg-accent/15 text-accent' : 'text-text-muted hover:bg-surface hover:text-text'
-              }`}
-              aria-pressed={active}
-            >
-              <Icon size={15} />
-              {label}
-            </button>
-          );
-        })}
+      {/* вкладки: одна строка с горизонтальным скроллом, без переноса */}
+      <div className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-1.5">
+        <div className="no-scrollbar flex min-w-0 flex-1 flex-nowrap gap-1 overflow-x-auto">
+          {visibleTabs.map(({ key, label, icon: Icon }) => {
+            const active = tab === key;
+            return (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setTab(key)}
+                className={`flex shrink-0 items-center gap-1 rounded-lg px-2.5 py-1 text-[12px] md:gap-1.5 md:px-3 md:py-1.5 md:text-[13px] ${
+                  active ? 'bg-accent/15 text-accent' : 'text-text-muted hover:bg-surface hover:text-text'
+                }`}
+                aria-pressed={active}
+              >
+                <Icon size={14} className="md:h-4 md:w-4" />
+                {label}
+              </button>
+            );
+          })}
+        </div>
+        <button
+          type="button"
+          onClick={() => setMoreTabsOpen((value) => !value)}
+          className={`flex shrink-0 items-center justify-center rounded-lg px-2 py-1 ${
+            moreTabsOpen ? 'bg-accent/15 text-accent' : 'text-text-muted hover:bg-surface'
+          }`}
+          aria-label={moreTabsOpen ? 'Свернуть папки' : 'Ещё папки'}
+          aria-expanded={moreTabsOpen}
+        >
+          {moreTabsOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+        </button>
       </div>
 
       {/* поиск */}
@@ -425,12 +536,64 @@ export function MainPage({ initialChatId }: { initialChatId?: string } = {}) {
       </div>
 
       {/* список чатов */}
-        <div className="min-h-0 flex-1 overflow-y-auto">
-        {filtered.length === 0 && (
+        <div
+          className="min-h-0 flex-1 overflow-y-auto"
+          onKeyDown={(e) => {
+            if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+            const rows = Array.from(
+              e.currentTarget.querySelectorAll<HTMLButtonElement>('[data-chat-row]'),
+            );
+            const idx = rows.indexOf(document.activeElement as HTMLButtonElement);
+            if (idx === -1) return;
+            e.preventDefault();
+            const next =
+              e.key === 'ArrowDown'
+                ? Math.min(rows.length - 1, idx + 1)
+                : Math.max(0, idx - 1);
+            rows[next]?.focus();
+          }}
+        >
+        {chatsLoading && chats.length === 0 && (
+          <div className="space-y-3 p-4">
+            {Array.from({ length: 5 }).map((_, i) => (
+              <div key={i} className="flex items-center gap-3">
+                <div className="h-10 w-10 animate-pulse rounded-full bg-surface" />
+                <div className="flex-1 space-y-2">
+                  <div className="h-3 w-1/2 animate-pulse rounded bg-surface" />
+                  <div className="h-3 w-3/4 animate-pulse rounded bg-surface" />
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+        {chatsError && chats.length === 0 && (
           <div className="px-6 py-10 text-center text-[13px] text-text-muted">
-            {chats.length === 0
-              ? 'Нет чатов. Найдите сотрудника и начните переписку'
-              : 'Ничего не найдено'}
+            Не удалось загрузить чаты.{' '}
+            <button
+              type="button"
+              onClick={() => emit('chat:updated', {})}
+              className="text-accent hover:underline"
+            >
+              Повторить
+            </button>
+          </div>
+        )}
+        {!chatsLoading && !chatsError && filtered.length === 0 && (
+          <div className="flex flex-col items-center gap-3 px-6 py-10 text-center text-[13px] text-text-muted">
+            <span>
+              {chats.length === 0
+                ? 'Пока нет чатов. Создайте первый — личный или групповой.'
+                : 'В этой папке пусто'}
+            </span>
+            {chats.length === 0 && (
+              <button
+                type="button"
+                onClick={() => setNewChatOpen(true)}
+                className="rounded-lg bg-accent px-3 py-1.5 text-[13px] font-medium text-white hover:opacity-85"
+              >
+                Создать чат
+              </button>
+            )}
           </div>
         )}
         {filtered.map((item) => (
@@ -440,14 +603,15 @@ export function MainPage({ initialChatId }: { initialChatId?: string } = {}) {
             myId={myId}
             active={selectedId === item.chat.id}
             archived={archivedIds.has(item.chat.id)}
+            incognito={incognito}
             onClick={() => openChat(item.chat.id)}
             onArchive={() => void toggleArchive(item.chat.id)}
           />
         ))}
       </div>
 
-      {/* компактный футер: основное действие — «Создать чат» */}
-      <footer className="shrink-0 border-t border-border p-2.5">
+      {/* компактный футер: на телефоне его заменяет нижняя навигация */}
+      <footer className="hidden shrink-0 border-t border-border p-2.5 min-[900px]:block">
         <button
           type="button"
           onClick={() => setNewChatOpen(true)}
@@ -537,7 +701,10 @@ export function MainPage({ initialChatId }: { initialChatId?: string } = {}) {
       {notificationsOpen && myId && (
         <BroadcastsPanel
           myId={myId}
-          onClose={() => setNotificationsOpen(false)}
+          onClose={() => {
+            setNotificationsOpen(false);
+            if (location.search) navigate('/main', { replace: true });
+          }}
         />
       )}
     </div>
@@ -631,7 +798,9 @@ function NewChatModal({
   };
 
   const canCreate =
-    !busy && (type === 'direct' ? selected.length === 1 : selected.length >= 1);
+    !busy &&
+    selected.length >= 1 &&
+    (type === 'direct' || validateGroupTitle(title).ok);
 
   const create = async () => {
     if (!canCreate) return;
@@ -678,12 +847,18 @@ function NewChatModal({
         </div>
 
         {type === 'group' && (
-          <Input
-            label="Название чата"
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            placeholder="Например, «Дежурная смена»"
-          />
+          <div>
+            <Input
+              label="Название чата"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="Например, «Дежурная смена»"
+              maxLength={60}
+            />
+            {title.trim().length > 0 && !validateGroupTitle(title).ok && (
+              <p className="mt-1 text-[12px] text-danger">{validateGroupTitle(title).error}</p>
+            )}
+          </div>
         )}
 
         <div className="relative">
@@ -1169,3 +1344,4 @@ function BroadcastsPanel({ myId, onClose }: { myId: string; onClose: () => void 
     </ModalOverlay>
   );
 }
+

@@ -1,22 +1,43 @@
-﻿import { useEffect, useMemo, useRef, useState } from 'react';
-import { Check, CheckCheck, CornerUpLeft, Download, Pause, Play, X } from 'lucide-react';
+﻿import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import {
+  Check,
+  CheckCheck,
+  Clock,
+  CornerUpLeft,
+  Download,
+  FileText,
+  ListChecks,
+  Lock,
+  MapPin,
+  Pause,
+  Play,
+  X,
+} from 'lucide-react';
 import * as db from '../lib/db';
+import { formatDuration } from '../lib/format';
 import { decryptEnvelope, decryptEnvelopeToString, decryptGroupEnvelope } from '../lib/crypto';
+import { isSticker, stickerEmoji } from '../lib/stickers';
+import { formatBytes, isPdfFile, isTextFile, parseFileMeta } from '../lib/documents';
+import { parsePoll, pollVoteKey } from '../lib/polls';
+import type { Poll } from '../lib/polls';
+import { parseFormatting } from '../lib/formatting';
+import { mapUrl, parseLocation } from '../lib/location';
+import { parseTodo, todoDoneKey } from '../lib/todo';
+import type { TodoList } from '../lib/todo';
 import type { Message, User } from '../types';
 
 function fmtTime(ts: number): string {
   return new Date(ts).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
 }
 
-function fmtDuration(sec?: number): string {
-  if (!sec || !Number.isFinite(sec)) return '0:00';
-  const m = Math.floor(sec / 60);
-  const s = Math.floor(sec % 60);
-  return `${m}:${String(s).padStart(2, '0')}`;
-}
-
-function FailedNotice({ text = '[Не удалось расшифровать]' }: { text?: string }) {
-  return <span className="text-text-muted">{text}</span>;
+function FailedNotice({ text = 'Зашифровано старым ключом' }: { text?: string }) {
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-md border border-border bg-black/5 px-2 py-1 text-[12px] text-text-muted">
+      <Lock size={12} />
+      {text}
+    </span>
+  );
 }
 
 // --- расшифровка ---------------------------------------------------------------
@@ -246,7 +267,7 @@ function Highlight({ text, query }: { text: string; query: string }) {
 
 // --- голосовое -------------------------------------------------------------
 
-const VOICE_BARS = 32;
+const VOICE_BARS = 44;
 
 /** Сжать произвольную огибающую до фиксированного числа столбцов. */
 function resampleWaveform(values: number[], count = VOICE_BARS): number[] {
@@ -284,6 +305,7 @@ function VoicePlayer({
   const [current, setCurrent] = useState(0);
   const [knownDuration, setKnownDuration] = useState(duration ?? 0);
   const [dragging, setDragging] = useState(false);
+  const [rate, setRate] = useState(1);
 
   const bars = useMemo(() => resampleWaveform(waveform ?? []), [waveform]);
   const total = knownDuration || duration || 0;
@@ -316,7 +338,9 @@ function VoicePlayer({
       <button
         type="button"
         onClick={toggle}
-        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-accent text-white shadow-sm transition-transform active:scale-95"
+        className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-accent text-white shadow-sm transition-transform active:scale-95 ${
+          playing ? 'play-pulse' : ''
+        }`}
         aria-label={playing ? 'Пауза' : 'Воспроизвести'}
       >
         {playing ? <Pause size={16} /> : <Play size={16} className="ml-0.5" />}
@@ -351,7 +375,7 @@ function VoicePlayer({
             return (
               <span
                 key={i}
-                className={`w-[3px] shrink-0 rounded-full transition-[height,background-color] duration-150 ${
+                className={`w-[2px] shrink-0 rounded-full transition-[height,background-color] duration-150 ${
                   played ? 'bg-accent' : 'bg-text-muted/35'
                 }`}
                 style={{ height: `${Math.max(18, Math.round(v * 100))}%` }}
@@ -360,8 +384,20 @@ function VoicePlayer({
           })}
         </div>
         <div className="mt-0.5 flex items-center justify-between text-[11px] tabular-nums text-text-muted">
-          <span>{fmtDuration(playing || current > 0 ? current : total)}</span>
-          <span>{fmtDuration(total)}</span>
+          <span>{formatDuration(playing || current > 0 ? current : total)}</span>
+          <button
+            type="button"
+            onClick={() => {
+              const next = rate === 1 ? 1.5 : rate === 1.5 ? 2 : 1;
+              setRate(next);
+              if (audioRef.current) audioRef.current.playbackRate = next;
+            }}
+            className="rounded px-1 text-[11px] font-medium text-accent hover:bg-accent/10"
+            aria-label="Скорость воспроизведения"
+          >
+            {rate === 1 ? '1×' : `${rate}×`}
+          </button>
+          <span>{formatDuration(total)}</span>
         </div>
       </div>
 
@@ -406,7 +442,7 @@ function PhotoContent({ url }: { url: string }) {
       </button>
       {full && (
         <div
-          className="fixed inset-0 z-[80] flex flex-col items-center justify-center gap-4 bg-black/90 p-4"
+          className="fade-in fixed inset-0 z-[80] flex flex-col items-center justify-center gap-4 bg-black/90 p-4"
           onPointerDown={(e) => e.stopPropagation()}
           onClick={() => setFull(false)}
         >
@@ -425,7 +461,7 @@ function PhotoContent({ url }: { url: string }) {
             src={url}
             alt="Фото"
             onClick={(e) => e.stopPropagation()}
-            className="max-h-[80vh] max-w-[92vw] rounded-lg object-contain"
+            className="modal-in max-h-[80vh] max-w-[92vw] rounded-lg object-contain"
           />
           <a
             href={url}
@@ -520,7 +556,7 @@ function CircleContent({ url, duration }: { url: string; duration?: number }) {
       )}
 
       <span className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-black/55 px-2 py-0.5 text-[12px] tabular-nums text-white">
-        {fmtDuration(playing || current > 0 ? current : total)}
+        {formatDuration(playing || current > 0 ? current : total)}
       </span>
     </div>
   );
@@ -585,7 +621,7 @@ function VideoContent({ url, duration }: { url: string; duration?: number }) {
 
       <div className="absolute inset-x-0 bottom-0 flex items-center gap-2 bg-gradient-to-t from-black/75 to-transparent px-2 pb-1.5 pt-6">
         <span className="shrink-0 text-[11px] tabular-nums text-white">
-          {fmtDuration(current)}
+          {formatDuration(current)}
         </span>
         <div
           className="h-1 flex-1 cursor-pointer rounded-full bg-white/30"
@@ -602,8 +638,17 @@ function VideoContent({ url, duration }: { url: string; duration?: number }) {
           />
         </div>
         <span className="shrink-0 text-[11px] tabular-nums text-white/85">
-          {fmtDuration(total)}
+          {formatDuration(total)}
         </span>
+        <a
+          href={url}
+          download="video.webm"
+          onClick={(event) => event.stopPropagation()}
+          className="shrink-0 text-white/80 hover:text-white"
+          aria-label="Скачать видео"
+        >
+          <Download size={14} />
+        </a>
       </div>
     </div>
   );
@@ -612,6 +657,9 @@ function VideoContent({ url, duration }: { url: string; duration?: number }) {
 // --- статус -------------------------------------------------------------------
 
 function StatusIcon({ status }: { status: Message['status'] }) {
+  if (status === 'queued') {
+    return <Clock size={13} className="text-text-muted" aria-label="В очереди" />;
+  }
   if (status === 'sent') {
     return <Check size={14} className="text-text-muted" aria-label="Отправлено" />;
   }
@@ -669,6 +717,7 @@ function ReplyQuote({
         photo: '[Фото]',
         video: '[Видео]',
         circle: '[Кружок]',
+        document: '[Документ]',
         text: '',
       };
       return labels[replyMsg.type];
@@ -705,9 +754,13 @@ export interface MessageBubbleProps {
   highlight?: string;
   /** долгое нажатие / правая кнопка мыши */
   onLongPress?: (msg: Message) => void;
+  /** кто прочитал (для своих сообщений в группе) */
+  readers?: User[];
+  /** локальная реакция на сообщение */
+  reaction?: string;
 }
 
-export function MessageBubble({
+function MessageBubbleBase({
   msg,
   sender,
   own,
@@ -716,9 +769,12 @@ export function MessageBubble({
   showSenderName = false,
   highlight = '',
   onLongPress,
+  readers,
+  reaction,
 }: MessageBubbleProps) {
   const pressTimer = useRef<number | null>(null);
   const pressStart = useRef<{ x: number; y: number } | null>(null);
+  const navigate = useNavigate();
 
   const clearTimer = () => {
     if (pressTimer.current !== null) {
@@ -750,7 +806,7 @@ export function MessageBubble({
   const deleted = msg.deleted === true;
 
   return (
-    <div className={`flex flex-col ${own ? 'items-end' : 'items-start'}`}>
+    <div className={`bubble-in flex flex-col ${own ? 'items-end' : 'items-start'}`}>
       <div
         onPointerDown={(e) => {
           if (e.pointerType === 'mouse' && e.button !== 0) return;
@@ -770,7 +826,17 @@ export function MessageBubble({
         } ${deleted ? 'italic text-text-muted' : 'text-text'}`}
       >
         {showSenderName && !deleted && (
-          <div className="mb-0.5 truncate text-[12px] font-medium text-accent">{sender.fullName}</div>
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              navigate(`/profile/${sender.id}`);
+            }}
+            className="mb-0.5 block max-w-full truncate text-left text-[12px] font-medium text-accent hover:underline"
+            title="Открыть профиль"
+          >
+            {sender.fullName}
+          </button>
         )}
         {msg.replyToId && !deleted && (
           <ReplyQuote
@@ -801,9 +867,36 @@ export function MessageBubble({
           </span>
         )}
       </span>
+      {own && readers && readers.length > 0 && (
+        <span className="mt-0.5 flex items-center -space-x-1 px-1">
+          {readers.slice(0, 4).map((reader) => (
+            <span
+              key={reader.id}
+              title={`Прочитал: ${reader.fullName}`}
+              className="flex h-4 w-4 items-center justify-center rounded-full border border-bg bg-accent/20 text-[9px] font-medium text-accent"
+            >
+              {reader.fullName.slice(0, 1)}
+            </span>
+          ))}
+          {readers.length > 4 && (
+            <span className="pl-1 text-[10px] text-text-muted">+{readers.length - 4}</span>
+          )}
+        </span>
+      )}
+      {reaction && (
+        <span className="mt-0.5 px-1 text-[16px]" aria-label={`Реакция ${reaction}`}>
+          {reaction}
+        </span>
+      )}
     </div>
   );
 }
+
+/**
+ * Лента может содержать сотни сообщений. memo не даёт перерисовывать пузыри,
+ * которые не изменились (статусы, правка, удаление — новые пропсы).
+ */
+export const MessageBubble = memo(MessageBubbleBase);
 
 function Content({
   msg,
@@ -834,6 +927,26 @@ function Content({
   );
 }
 
+function Spoiler({ children }: { children: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={(event) => {
+        event.stopPropagation();
+        setOpen((value) => !value);
+      }}
+      className={`rounded px-1 text-left ${
+        open ? 'bg-transparent text-inherit' : 'bg-text/80 text-transparent'
+      }`}
+      title={open ? 'Скрыть спойлер' : 'Показать спойлер'}
+      aria-label={open ? 'Скрыть спойлер' : 'Показать спойлер'}
+    >
+      {children}
+    </button>
+  );
+}
+
 function TextContent({
   msg,
   sender,
@@ -848,11 +961,52 @@ function TextContent({
   highlight: string;
 }) {
   const { text, failed, noKey } = useDecryptedText(msg, sender, myId, peerPublicKeyJwk);
-  if (noKey) return <span className="text-text-muted">Нет ключа для расшифровки</span>;
-  if (failed) return <FailedNotice />;
+  const [expanded, setExpanded] = useState(false);
+  if (noKey || failed) return <FailedNotice />;
+  if (text && isSticker(text)) {
+    return (
+      <span className="text-[44px] leading-none" aria-label="Стикер">
+        {stickerEmoji(text)}
+      </span>
+    );
+  }
+  const poll = text ? parsePoll(text) : null;
+  if (poll) return <PollContent poll={poll} messageId={msg.id} />;
+  const geo = text ? parseLocation(text) : null;
+  if (geo) return <GeoContent point={geo} />;
+  const todo = text ? parseTodo(text) : null;
+  if (todo) return <TodoContent list={todo} messageId={msg.id} />;
+  const value = text ?? '';
+  const isLong = value.length > 500;
+  const shown = isLong && !expanded ? `${value.slice(0, 500)}…` : value;
   return (
     <span className="whitespace-pre-wrap break-words">
-      <Highlight text={text ?? ''} query={highlight} />
+      {parseFormatting(shown).map((token, index) => {
+        if (token.type === 'bold') return <strong key={index}>{token.value}</strong>;
+        if (token.type === 'italic') return <em key={index}>{token.value}</em>;
+        if (token.type === 'underline') return <u key={index}>{token.value}</u>;
+        if (token.type === 'strike') return <s key={index}>{token.value}</s>;
+        if (token.type === 'spoiler') {
+          return <Spoiler key={index}>{token.value}</Spoiler>;
+        }
+        if (token.type === 'code') {
+          return (
+            <code key={index} className="rounded bg-black/15 px-1 py-0.5 font-mono text-[0.92em]">
+              {token.value}
+            </code>
+          );
+        }
+        return <Highlight key={index} text={token.value} query={highlight} />;
+      })}
+      {isLong && (
+        <button
+          type="button"
+          onClick={() => setExpanded((current) => !current)}
+          className="mt-1 block text-[13px] font-medium text-accent hover:underline"
+        >
+          {expanded ? 'Свернуть' : 'Показать полностью'}
+        </button>
+      )}
     </span>
   );
 }
@@ -868,6 +1022,9 @@ function MediaContent({
   myId: string;
   peerPublicKeyJwk?: JsonWebKey;
 }) {
+  if (msg.type === 'document') {
+    return <DocumentContent msg={msg} myId={myId} />;
+  }
   const { url, failed, notFound } = useDecryptedMedia(msg, sender, myId, peerPublicKeyJwk);
   if (failed) {
     return notFound ? (
@@ -891,3 +1048,227 @@ function MediaContent({
       return <FailedNotice />;
   }
 }
+
+/** Геолокация: координаты и ссылка на карту. */
+function GeoContent({ point }: { point: { lat: number; lng: number } }) {
+  return (
+    <a
+      href={mapUrl(point)}
+      target="_blank"
+      rel="noreferrer"
+      onClick={(event) => event.stopPropagation()}
+      className="flex items-center gap-2 rounded-lg border border-border bg-black/5 px-2.5 py-2 text-[13px] text-accent hover:underline"
+    >
+      <MapPin size={18} />
+      <span>
+        {point.lat.toFixed(4)}, {point.lng.toFixed(4)}
+        <span className="block text-[11px] text-text-muted">Открыть карту</span>
+      </span>
+    </a>
+  );
+}
+
+/** Список задач: отметки хранятся на устройстве. */
+function TodoContent({ list, messageId }: { list: TodoList; messageId: string }) {
+  const [done, setDone] = useState<number[]>(() => {
+    try {
+      const raw = localStorage.getItem(todoDoneKey(messageId));
+      return raw ? (JSON.parse(raw) as number[]) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const toggle = (index: number) => {
+    const next = done.includes(index) ? done.filter((i) => i !== index) : [...done, index];
+    setDone(next);
+    try {
+      localStorage.setItem(todoDoneKey(messageId), JSON.stringify(next));
+    } catch {
+      /* приватный режим */
+    }
+  };
+
+  return (
+    <div className="min-w-[210px] max-w-[280px]">
+      <div className="mb-1 flex items-center gap-1.5 text-[13px] font-medium text-text">
+        <ListChecks size={16} className="text-accent" />
+        Список задач
+      </div>
+      <div className="space-y-1">
+        {list.items.map((item, index) => (
+          <button
+            key={`${item}-${index}`}
+            type="button"
+            onClick={() => toggle(index)}
+            className="flex w-full items-start gap-2 rounded-md px-1 py-0.5 text-left text-[13px] hover:bg-black/5"
+          >
+            <span
+              className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border ${
+                done.includes(index)
+                  ? 'border-accent bg-accent text-white'
+                  : 'border-border'
+              }`}
+            >
+              {done.includes(index) ? '✓' : ''}
+            </span>
+            <span className={done.includes(index) ? 'text-text-muted line-through' : 'text-text'}>
+              {item}
+            </span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** Опрос: вопрос и варианты, голос хранится на устройстве. */
+function PollContent({ poll, messageId }: { poll: Poll; messageId: string }) {
+  const [vote, setVote] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(pollVoteKey(messageId));
+    } catch {
+      return null;
+    }
+  });
+
+  const choose = (option: string) => {
+    setVote(option);
+    try {
+      localStorage.setItem(pollVoteKey(messageId), option);
+    } catch {
+      /* приватный режим */
+    }
+  };
+
+  return (
+    <div className="min-w-[210px] max-w-[280px]">
+      <div className="text-[14px] font-medium text-text">{poll.q}</div>
+      <div className="mt-2 space-y-1.5">
+        {poll.options.map((option) => (
+          <button
+            key={option}
+            type="button"
+            onClick={() => choose(option)}
+            className={`w-full rounded-md border px-2.5 py-1.5 text-left text-[13px] ${
+              vote === option
+                ? 'border-accent bg-accent/15 text-accent'
+                : 'border-border text-text hover:border-accent'
+            }`}
+          >
+            {option}
+            {vote === option && ' ✓'}
+          </button>
+        ))}
+      </div>
+      <div className="mt-2 text-[11px] text-text-muted">
+        {vote ? `Ваш голос: ${vote}` : 'Выберите вариант'} · голос хранится на устройстве
+      </div>
+    </div>
+  );
+}
+
+/** Документ: имя/размер из mime_type, расшифровка только по действию. */function DocumentContent({ msg, myId }: { msg: Message; myId: string }) {
+  const meta = parseFileMeta(msg.mimeType);
+  const [url, setUrl] = useState<string | null>(null);
+  const [text, setText] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(
+    () => () => {
+      if (url) URL.revokeObjectURL(url);
+    },
+    [url],
+  );
+
+  const load = async (): Promise<{ blob: Blob; url: string } | null> => {
+    setBusy(true);
+    setError(null);
+    try {
+      const blob = await db.getDecryptedMediaBlob(msg, myId);
+      if (!blob) {
+        setError('Файл недоступен');
+        return null;
+      }
+      const objectUrl = URL.createObjectURL(blob);
+      setUrl(objectUrl);
+      return { blob, url: objectUrl };
+    } catch {
+      setError('Не удалось расшифровать файл');
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const download = async () => {
+    const result = await load();
+    if (!result) return;
+    const link = document.createElement('a');
+    link.href = result.url;
+    link.download = meta.name;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(result.url), 5000);
+  };
+
+  const preview = async () => {
+    const result = await load();
+    if (!result) return;
+    if (isTextFile(meta)) {
+      setText((await result.blob.text()).slice(0, 200));
+    }
+  };
+
+  return (
+    <div className="min-w-[210px] max-w-[280px] rounded-lg border border-border bg-black/5 p-2.5">
+      <div className="flex items-center gap-2">
+        <FileText size={26} className="shrink-0 text-accent" />
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-[13px] font-medium text-text" title={meta.name}>
+            {meta.name}
+          </div>
+          <div className="text-[12px] text-text-muted">{formatBytes(meta.size) || 'Документ'}</div>
+        </div>
+      </div>
+
+      {(isPdfFile(meta) || isTextFile(meta)) && (
+        <div className="mt-2 flex gap-2">
+          <button
+            type="button"
+            onClick={() => void preview()}
+            disabled={busy}
+            className="rounded-md border border-border px-2 py-1 text-[12px] text-text hover:border-accent hover:text-accent disabled:opacity-50"
+          >
+            Превью
+          </button>
+        </div>
+      )}
+
+      <button
+        type="button"
+        onClick={() => void download()}
+        disabled={busy}
+        className="mt-2 flex w-full items-center justify-center gap-1.5 rounded-md bg-accent px-2 py-1.5 text-[12px] font-medium text-white hover:opacity-85 disabled:opacity-50"
+      >
+        <Download size={14} />
+        {busy ? 'Расшифровка…' : 'Скачать'}
+      </button>
+
+      {error && <div className="mt-1 text-[12px] text-danger">{error}</div>}
+      {text !== null && (
+        <pre className="mt-2 max-h-24 overflow-auto whitespace-pre-wrap rounded-md bg-bg p-2 text-[12px] text-text">
+          {text || 'Пустой файл'}
+        </pre>
+      )}
+      {url && isPdfFile(meta) && text === null && (
+        <iframe
+          title={meta.name}
+          src={`${url}#page=1&toolbar=0`}
+          className="mt-2 h-48 w-full rounded-md border border-border bg-white"
+        />
+      )}
+    </div>
+  );
+}
+
