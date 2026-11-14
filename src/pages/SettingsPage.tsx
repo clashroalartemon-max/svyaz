@@ -120,6 +120,19 @@ export function SettingsPage() {
     if (!ok) setProfileNotice('Не удалось сохранить: примените supabase/last_seen.sql');
   };
 
+  const syncHistory = async () => {
+    if (!myId || !me) return;
+    const password = window.prompt('Пароль для синхронизации истории');
+    if (!password) return;
+    try {
+      const restored = await db.syncMasterHistory(myId, me.login, password);
+      setProfileNotice(restored ? 'История синхронизирована' : 'Ключ истории уже актуален');
+      if (restored) window.setTimeout(() => window.location.reload(), 700);
+    } catch {
+      setProfileNotice('Не удалось синхронизировать: проверьте пароль и supabase/master_key.sql');
+    }
+  };
+
   const exportKey = () => {
     if (!myId) return;
     const jwk = getPrivateKey(myId);
@@ -429,6 +442,9 @@ export function SettingsPage() {
               Импортировать ключ
               <input type="file" accept="application/json,.json" onChange={(e) => void importKey(e)} className="hidden" />
             </label>
+            <Button type="button" variant="secondary" onClick={() => void syncHistory()}>
+              Синхронизировать историю
+            </Button>
           </div>
         </Section>
 

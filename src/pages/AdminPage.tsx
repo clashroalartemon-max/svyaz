@@ -35,6 +35,7 @@ type AdminTab =
   | 'chats'
   | 'broadcasts'
   | 'complaints'
+  | 'security'
   | 'audit'
   | 'structure'
   | 'settings';
@@ -177,6 +178,7 @@ export function AdminPage() {
         {tab === 'chats' && <ChatsTab users={users} setNotice={setNotice} setError={setError} />}
         {tab === 'broadcasts' && <BroadcastsTab setNotice={setNotice} setError={setError} />}
         {tab === 'complaints' && <ComplaintsTab />}
+        {tab === 'security' && <SecurityTab />}
         {tab === 'audit' && <AuditTab />}
         {tab === 'structure' && <StructureTab setNotice={setNotice} setError={setError} />}
         {tab === 'settings' && (
@@ -1840,6 +1842,101 @@ function ToggleRow({
           }`}
         />
       </button>
+    </div>
+  );
+}
+
+function SecurityTab() {
+  const [events, setEvents] = useState<db.LoginEvent[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const load = () => {
+    setError(null);
+    Promise.all([db.getLoginEvents(100), db.getAllUsers()])
+      .then(([list, all]) => {
+        setEvents(list);
+        setUsers(all);
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : 'Не удалось загрузить журнал входов'));
+  };
+
+  useEffect(load, []);
+
+  const setBlocked = async (login: string, blocked: boolean) => {
+    const user = users.find((u) => u.login === login);
+    if (!user) {
+      setError(`Пользователь ${login} не найден`);
+      return;
+    }
+    setBusy(login + String(blocked));
+    try {
+      await db.adminSetUserBlocked(user.id, blocked, blocked ? 'Заблокирован администратором' : undefined);
+      load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Не удалось изменить блокировку');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center justify-between gap-2">
+        <div>
+          <div className="text-[15px] font-medium text-text">Входы и блокировки</div>
+          <div className="text-[12px] text-text-muted">
+            Неверные пароли, новые устройства и геолокация. Всего записей: {events.length}
+          </div>
+        </div>
+        <Button variant="secondary" onClick={load}>Обновить</Button>
+      </div>
+      {error && <div className="rounded-lg border border-danger/40 px-3 py-2 text-[13px] text-danger">{error}</div>}
+      {events.length === 0 && !error && (
+        <div className="rounded-lg border border-border px-3 py-6 text-center text-[13px] text-text-muted">
+          Журнал пуст. Примените supabase/security_logins.sql и войдите заново.
+        </div>
+      )}
+      <div className="space-y-2">
+        {events.map((event) => (
+          <div key={event.id} className="rounded-lg border border-border bg-bg p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="truncate text-[14px] text-text">
+                  {event.login}
+                  <span className={`ml-2 text-[12px] ${event.success ? 'text-green-600' : 'text-danger'}`}>
+                    {event.success ? 'успешный вход' : 'неудачная попытка'}
+                  </span>
+                </div>
+                <div className="text-[12px] text-text-muted">
+                  {new Date(event.createdAt).toLocaleString('ru-RU')}
+                  {event.ip ? ` · IP ${event.ip}` : ''}
+                  {event.geo ? ` · ${event.geo}` : ''}
+                </div>
+                {event.reason && <div className="text-[12px] text-text-muted">{event.reason}</div>}
+                {event.device && <div className="truncate text-[11px] text-text-muted">{event.device}</div>}
+              </div>
+              <div className="flex shrink-0 gap-2">
+                <Button
+                  variant="secondary"
+                  disabled={busy !== null}
+                  onClick={() => void setBlocked(event.login, true)}
+                >
+                  Заблокировать
+                </Button>
+                <Button
+                  variant="secondary"
+                  disabled={busy !== null}
+                  onClick={() => void setBlocked(event.login, false)}
+                >
+                  Разблокировать
+                </Button>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

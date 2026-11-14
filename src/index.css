@@ -1,4 +1,4 @@
-@tailwind base;
+﻿@tailwind base;
 @tailwind components;
 @tailwind utilities;
 
@@ -30,6 +30,9 @@ html,
 body,
 #root {
   height: 100%;
+  width: 100%;
+  max-width: 100vw;
+  overflow-x: hidden;
 }
 
 /* Мобильные браузеры: 100% считается от «большого» вьюпорта, и при появлении
@@ -185,4 +188,14 @@ body {
 /* Плавная смена светлой/тёмной темы */
 html, body, .bg-bg, .text-text, .border-border {
   transition: background-color 250ms ease, color 250ms ease, border-color 250ms ease;
+}
+
+
+@keyframes msg-focus-pulse {
+  0%, 100% { background-color: transparent; }
+  12%, 70% { background-color: color-mix(in srgb, var(--accent) 22%, transparent); }
+}
+.msg-focus {
+  animation: msg-focus-pulse 3s ease;
+  border-radius: 10px;
 }

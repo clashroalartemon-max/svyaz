@@ -669,3 +669,59 @@ export async function decryptEnvelopeToString(params: DecryptParams): Promise<st
   const bytes = await decryptEnvelope(params);
   return textDecoder.decode(bytes);
 }
+
+// --- мастер-ключ ---------------------------------------------------------------
+
+/** Случайный мастер-ключ AES-GCM 256 (base64). */
+export function generateMasterKey(): string {
+  return toBase64(randomBytes(32));
+}
+
+/** Зашифровать произвольную строку паролем: base64(iv || ciphertext). */
+export async function encryptSecretWithPassword(value: string, password: string): Promise<string> {
+  const keyBytes = await deriveKeyFromPassword(password);
+  const iv = randomBytes(IV_BYTES);
+  const ciphertext = await aesEncryptBytes(keyBytes, iv, textEncoder.encode(value));
+  const out = new Uint8Array(new ArrayBuffer(iv.length + ciphertext.length));
+  out.set(iv, 0);
+  out.set(ciphertext, iv.length);
+  return toBase64(out);
+}
+
+/** Расшифровать строку, зашифрованную паролем. */
+export async function decryptSecretWithPassword(encrypted: string, password: string): Promise<string> {
+  const keyBytes = await deriveKeyFromPassword(password);
+  const data = fromBase64(encrypted);
+  const iv = data.subarray(0, IV_BYTES);
+  const ciphertext = data.subarray(IV_BYTES);
+  const plaintext = await aesDecryptBytes(keyBytes, iv, ciphertext);
+  return textDecoder.decode(plaintext);
+}
+
+/** Зашифровать приватный ключ мастер-ключом. */
+export async function encryptWithMasterKey(
+  value: string,
+  masterKeyB64: string,
+): Promise<string> {
+  const keyBytes = fromBase64(masterKeyB64);
+  if (keyBytes.length !== 32) throw new Error('Мастер-ключ должен быть 32 байта');
+  const iv = randomBytes(IV_BYTES);
+  const ciphertext = await aesEncryptBytes(keyBytes, iv, textEncoder.encode(value));
+  const out = new Uint8Array(new ArrayBuffer(iv.length + ciphertext.length));
+  out.set(iv, 0);
+  out.set(ciphertext, iv.length);
+  return toBase64(out);
+}
+
+/** Расшифровать приватный ключ мастер-ключом. */
+export async function decryptWithMasterKey(
+  encrypted: string,
+  masterKeyB64: string,
+): Promise<string> {
+  const keyBytes = fromBase64(masterKeyB64);
+  const data = fromBase64(encrypted);
+  const iv = data.subarray(0, IV_BYTES);
+  const ciphertext = data.subarray(IV_BYTES);
+  const plaintext = await aesDecryptBytes(keyBytes, iv, ciphertext);
+  return textDecoder.decode(plaintext);
+}

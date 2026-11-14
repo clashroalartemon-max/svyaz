@@ -1,6 +1,6 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ChangeEvent, KeyboardEvent, ReactNode } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
   ArrowDown,
   ArrowLeft,
@@ -54,7 +54,7 @@ import { encodePoll } from '../lib/polls';
 import { getReaction, toggleReaction } from '../lib/reactions';
 import { encodeLocation } from '../lib/location';
 import { encodeTodo } from '../lib/todo';
-import { Avatar, InfoButton, RankBadge } from '../ui';
+import { Avatar, RankBadge } from '../ui';
 import { MessageBubble } from './MessageBubble';
 import {
   AddParticipantModal,
@@ -130,6 +130,11 @@ function normalizeWaveform(values: number[], buckets = WAVEFORM_BUCKETS): number
   return out;
 }
 
+function shortName(full: string): string {
+  const parts = full.trim().split(/\s+/);
+  return parts.length >= 2 ? ` ` : full;
+}
+
 function fmtTimer(sec: number): string {
   const s = Math.max(0, Math.floor(sec));
   const m = Math.floor(s / 60);
@@ -187,6 +192,21 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
   const { chat, loaded: chatLoaded, error: chatError } = useChat(chatId);
   const peer = usePeer(chat, myId);
   const messages = useMessages(chatId);
+  const [searchParams] = useSearchParams();
+  const focusMessageId = searchParams.get('m');
+
+  // Переход из профиля: ?m=<id> — прокручиваем к сообщению и подсвечиваем.
+  useEffect(() => {
+    if (!focusMessageId) return;
+    const timer = window.setTimeout(() => {
+      const node = document.querySelector(`[data-msg-id="${focusMessageId}"]`);
+      if (!node) return;
+      node.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      node.classList.add('msg-focus');
+      window.setTimeout(() => node.classList.remove('msg-focus'), 3200);
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [focusMessageId, messages.length]);
   const isDesktop = useMediaQuery('(min-width: 900px)');
   const isSaved = chat?.saved === true;
   // Групповой — по типу чата, а не по числу людей: группа может состоять из
@@ -1172,7 +1192,7 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
     return <div className="flex h-full items-center justify-center text-text-muted">Загрузка…</div>;
   }
 
-  const title = isSaved ? 'Избранное' : isGroup ? (chat.title ?? peer.fullName) : getContactName(peer.id) ?? peer.fullName;
+  const title = isSaved ? 'Избранное' : isGroup ? (chat.title ?? peer.fullName) : shortName(getContactName(peer.id) ?? peer.fullName);
   const members = chat.participants?.length ?? 0;
   const membersLabel = `${members} ${pluralParticipants(members)}`;
   const subtitle = peerTyping
@@ -1244,23 +1264,16 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
           </div>
         )}
 
-        {!isSaved && !isGroupChat && (
-          <InfoButton
-            user={peer}
-            title="Информация о пользователе"
-          />
-        )}
-
         {!isSaved && !isGroupChat && peer && (
           <>
             <button
               type="button"
               onClick={() => setCallRequest({ mode: 'audio', nonce: Date.now() })}
-              className="shrink-0 rounded-lg p-2 text-text-muted hover:bg-surface hover:text-text"
+              className="shrink-0 rounded-lg p-1.5 text-text-muted hover:bg-surface hover:text-text"
               aria-label="Позвонить"
               title="Аудиозвонок"
             >
-              <Phone size={18} />
+              <Phone size={16} />
             </button>
             <button
               type="button"
@@ -1269,7 +1282,7 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
               aria-label="Видеозвонок"
               title="Видеозвонок"
             >
-              <Video size={18} />
+              <Video size={16} />
             </button>
           </>
         )}
@@ -1957,4 +1970,7 @@ function MenuButton({
     </button>
   );
 }
+
+
+
 

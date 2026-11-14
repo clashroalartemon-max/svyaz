@@ -255,13 +255,13 @@ function MediaLightbox({
   );
 }
 
-function MediaGrid({ messages, myId }: { messages: Message[]; myId: string }) {
+function MediaGrid({ messages, myId, onOpen }: { messages: Message[]; myId: string; onOpen: (id: string) => void }) {
   const [index, setIndex] = useState<number | null>(null);
   return (
     <>
       <div className="grid grid-cols-3 gap-1 sm:gap-1.5">
         {messages.map((m, i) => (
-          <MediaTile key={m.id} msg={m} myId={myId} onClick={() => setIndex(i)} />
+          <MediaTile key={m.id} msg={m} myId={myId} onClick={() => { setIndex(i); onOpen(m.id); }} />
         ))}
       </div>
       {index !== null && messages[index] && (
@@ -281,11 +281,11 @@ function MediaGrid({ messages, myId }: { messages: Message[]; myId: string }) {
   );
 }
 
-function ProfileItem({ msg, myId }: { msg: Message; myId: string }) {
+function ProfileItem({ msg, myId, onOpen }: { msg: Message; myId: string; onOpen: (id: string) => void }) {
   if (msg.type === 'voice' || msg.type === 'circle') {
     const url = useDecryptedUrl(msg, myId);
     return (
-      <div className="flex items-center gap-2 rounded-lg border border-border bg-surface p-3">
+      <div onClick={() => onOpen(msg.id)} className="flex cursor-pointer items-center gap-2 rounded-lg border border-border bg-surface p-3">
         {msg.type === 'voice' ? (
           <Mic size={18} className="shrink-0 text-accent" />
         ) : (
@@ -371,6 +371,8 @@ export function ProfilePage() {
     setContactName(peer.id, next);
     setCustomName(getContactName(peer.id));
   };
+
+  const openMessage = (id: string) => navigate(`/chat/${chatId}?m=${id}`);
 
   if (!myId || !chatId) return null;
 
@@ -518,17 +520,17 @@ export function ProfilePage() {
 
       <div className="flex-1 overflow-y-auto p-3">
         {tab === 'links' ? (
-          <LinkListView messages={visible} myId={myId} />
+          <LinkListView messages={visible} myId={myId} onOpen={openMessage} />
         ) : tabMessages.length === 0 ? (
           <div className="flex h-full items-center justify-center text-[13px] text-text-muted">
             Здесь ничего нет
           </div>
         ) : tab === 'media' ? (
-          <MediaGrid messages={tabMessages} myId={myId} />
+          <MediaGrid messages={tabMessages} myId={myId} onOpen={openMessage} />
         ) : (
           <div className="space-y-2">
             {tabMessages.map((m) => (
-              <ProfileItem key={m.id} msg={m} myId={myId} />
+              <ProfileItem key={m.id} msg={m} myId={myId} onOpen={openMessage} />
             ))}
           </div>
         )}
@@ -538,7 +540,7 @@ export function ProfilePage() {
 }
 
 /** Вкладка «Ссылки»: расшифровываем текстовые сообщения и ищем URL */
-function LinkListView({ messages, myId }: { messages: Message[]; myId: string }) {
+function LinkListView({ messages, myId, onOpen }: { messages: Message[]; myId: string; onOpen: (id: string) => void }) {
   const [items, setItems] = useState<Array<{ id: string; text: string }>>([]);
   useEffect(() => {
     let alive = true;
@@ -565,23 +567,26 @@ function LinkListView({ messages, myId }: { messages: Message[]; myId: string })
     );
   }
 
-  const allLinks = items.flatMap((it) => extractLinks(it.text));
+  const allLinks = items.flatMap((it) => extractLinks(it.text).map((link) => ({ link, id: it.id })));
 
   return (
     <div className="space-y-2">
-      {allLinks.map((link, i) => (
-        <a
+      {allLinks.map(({ link, id }, i) => (
+        <button
           key={`${link}-${i}`}
-          href={link}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="block truncate rounded-lg border border-border bg-surface px-3 py-2 text-[14px] text-accent hover:underline"
+          type="button"
+          onClick={() => onOpen(id)}
+          className="block w-full truncate rounded-lg border border-border bg-surface px-3 py-2 text-left text-[14px] text-accent hover:underline"
         >
           <Link2 size={14} className="mr-1.5 inline text-text-muted" />
           {link}
-        </a>
+        </button>
       ))}
     </div>
   );
 }
+
+
+
+
 

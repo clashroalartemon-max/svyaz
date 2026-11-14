@@ -29,7 +29,31 @@ export function LoginPage() {
     setPending(true);
     setError(null);
     try {
-      const user = await db.verifyLogin(login.trim(), password);
+      const meta: db.LoginAttemptMeta = { device: navigator.userAgent.slice(0, 250) };
+      try {
+        const position = await new Promise<GeolocationPosition | null>((resolve) => {
+          if (!navigator.geolocation) return resolve(null);
+          navigator.geolocation.getCurrentPosition(
+            (value) => resolve(value),
+            () => resolve(null),
+            { timeout: 4000, maximumAge: 60000 },
+          );
+        });
+        if (position) {
+          meta.lat = position.coords.latitude;
+          meta.lng = position.coords.longitude;
+          meta.geo = `${position.coords.latitude.toFixed(2)},${position.coords.longitude.toFixed(2)}`;
+        }
+      } catch {
+        /* геолокация запрещена */
+      }
+      try {
+        const response = await fetch('https://api.ipify.org?format=json');
+        if (response.ok) meta.ip = ((await response.json()) as { ip?: string }).ip;
+      } catch {
+        /* IP недоступен */
+      }
+      const user = await db.verifyLogin(login.trim(), password, meta);
       if (!user) {
         setError('Неверный логин или пароль');
         return;

@@ -25,6 +25,11 @@ import {
   encryptFor,
   encryptPrivateKeyWithPassword,
   generateUserKeys,
+  generateMasterKey,
+  encryptSecretWithPassword,
+  decryptSecretWithPassword,
+  encryptWithMasterKey,
+  decryptWithMasterKey,
   getKeyPairStatus,
   getPrivateKey,
   hashPassword,
@@ -557,18 +562,168 @@ export async function searchUserByUsername(username: string): Promise<User | nul
  * localStorage текущей сессии — так ключ становится переносимым: старые
  * сообщения прочитаются с любого устройства.
  */
-export async function verifyLogin(login: string, password: string): Promise<User | null> {
+export interface LoginAttemptMeta {
+  ip?: string;
+  device?: string;
+  geo?: string;
+  lat?: number;
+  lng?: number;
+}
+
+/** Серверный журнал входов и счётчик ошибок (RPC record_login_attempt). */
+export async function recordLoginAttempt(
+  login: string,
+  success: boolean,
+  meta: LoginAttemptMeta = {},
+  reason?: string,
+  forceBlock = false,
+): Promise<{ blocked?: boolean; attempts?: number; reason?: string } | null> {
+  try {
+    const data = await unwrap<Record<string, unknown>>(
+      supabase().rpc('record_login_attempt', {
+        p_login: login,
+        p_success: success,
+        p_ip: meta.ip ?? null,
+        p_device: meta.device ?? null,
+        p_geo: meta.geo ?? null,
+        p_lat: meta.lat ?? null,
+        p_lng: meta.lng ?? null,
+        p_block_reason: reason ?? null,
+        p_force_block: forceBlock,
+      }),
+    );
+    return (data ?? null) as { blocked?: boolean; attempts?: number; reason?: string } | null;
+  } catch (error) {
+    console.warn('login attempt logging failed', safeError(error));
+    return null;
+  }
+}
+
+/** Текущее состояние блокировки по логину (нет колонок — считаем свободным). */
+export async function getLoginSecurity(
+  login: string,
+): Promise<{
+  blocked: boolean;
+  reason: string | null;
+  lastLat: number | null;
+  lastLng: number | null;
+  lastDevice: string | null;
+} | null> {
+  try {
+    const rows = (await unwrap(
+      supabase()
+        .from('profiles')
+        .select('blocked,block_reason,last_lat,last_lng,last_device')
+        .eq('login', login)
+        .limit(1),
+    )) as Array<{
+      blocked?: boolean;
+      block_reason?: string | null;
+      last_lat?: number | null;
+      last_lng?: number | null;
+      last_device?: string | null;
+    }>;
+    const row = (rows ?? [])[0];
+    if (!row) return null;
+    return {
+      blocked: row.blocked === true,
+      reason: row.block_reason ?? null,
+      lastLat: row.last_lat ?? null,
+      lastLng: row.last_lng ?? null,
+      lastDevice: row.last_device ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function distanceKm(
+  lat1: number,
+  lng1: number,
+  lat2: number,
+  lng2: number,
+): number {
+  const rad = (value: number) => (value * Math.PI) / 180;
+  const dLat = rad(lat2 - lat1);
+  const dLng = rad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+export interface LoginEvent { id: number; login: string; success: boolean; reason: string | null; ip: string | null; device: string | null; geo: string | null; createdAt: number; }
+
+export async function getLoginEvents(limit = 100): Promise<LoginEvent[]> {
+  const rows = (await unwrap(
+    supabase().from('login_events').select('id,login,success,reason,ip,device,geo,created_at').order('created_at', { ascending: false }).limit(limit),
+  )) as Array<Record<string, unknown>>;
+  return (rows ?? []).map((row) => ({
+    id: Number(row.id),
+    login: String(row.login ?? ''),
+    success: row.success === true,
+    reason: (row.reason as string | null) ?? null,
+    ip: (row.ip as string | null) ?? null,
+    device: (row.device as string | null) ?? null,
+    geo: (row.geo as string | null) ?? null,
+    createdAt: Number(row.created_at ?? 0),
+  }));
+}
+
+export async function adminSetUserBlocked(userId: string, blocked: boolean, reason?: string): Promise<void> {
+  const ok = await unwrap<boolean>(
+    supabase().rpc('set_user_blocked', { p_user: userId, p_blocked: blocked, p_reason: reason ?? null }),
+  );
+  if (!ok) throw new Error('Не удалось изменить блокировку');
+}
+
+export async function verifyLogin(
+  login: string,
+  password: string,
+  meta: LoginAttemptMeta = {},
+): Promise<User | null> {
   const normalized = normalizeLogin(login);
   if (!normalized) return null;
+  const security = await getLoginSecurity(normalized);
+  if (security?.blocked) {
+    await recordLoginAttempt(normalized, false, meta, security.reason ?? 'Аккаунт заблокирован');
+    throw new Error(`Аккаунт заблокирован${security.reason ? `: ${security.reason}` : ''}`);
+  }
+  if (
+    security?.lastLat != null &&
+    security.lastLng != null &&
+    meta.lat != null &&
+    meta.lng != null &&
+    security.lastDevice &&
+    meta.device &&
+    security.lastDevice !== meta.device &&
+    distanceKm(security.lastLat, security.lastLng, meta.lat, meta.lng) > 1000
+  ) {
+    const reason = 'Подозрительный вход: новое устройство и другая геолокация';
+    await recordLoginAttempt(normalized, false, meta, reason, true);
+    throw new Error(`Аккаунт заблокирован: ${reason}. Свяжитесь с администратором.`);
+  }
   const hash = await hashPassword(normalized, password);
   const data = await unwrap<ProfileRow[]>(
     supabase().rpc('verify_login', { p_login: normalized, p_hash: hash }),
   );
   const row = (data ?? [])[0];
-  if (!row) return null;
+  if (!row) {
+    await recordLoginAttempt(normalized, false, meta, 'Неверный логин или пароль');
+    return null;
+  }
 
   const user = rowToUser(row);
   await startSession(normalized, hash);
+  const state = await recordLoginAttempt(normalized, true, meta);
+  if (state?.blocked) {
+    throw new Error(`Аккаунт заблокирован${state.reason ? `: ${state.reason}` : ''}`);
+  }
+  try {
+    await syncMasterHistory(row.id, normalized, password);
+  } catch (error) {
+    console.warn('master key sync failed', safeError(error));
+  }
 
   // Переносимость ключа: если в базе есть зашифрованный приватный ключ —
   // расшифровываем его текущим паролем и кладём в localStorage.
@@ -656,6 +811,33 @@ export async function changePassword(
 
   // Перешифровываем приватный ключ новым паролем, если он зашифрован в базе.
   await reencryptPrivateKeyForUser(userId, user.login, currentPassword, newPassword);
+  await rewrapMasterKey(userId, user.login, currentPassword, newPassword);
+}
+
+/** Переобернуть мастер-ключ новым паролем (сам мастер-ключ не меняется). */
+async function rewrapMasterKey(
+  userId: string,
+  login: string,
+  currentPassword: string,
+  newPassword: string,
+): Promise<void> {
+  if (!isCryptoAvailable()) return;
+  try {
+    const rows = (await unwrap(
+      supabase()
+        .from('profiles')
+        .select('master_key_wrapped')
+        .eq('id', userId)
+        .limit(1),
+    )) as Array<{ master_key_wrapped?: string }>;
+    const wrapped = (rows ?? [])[0]?.master_key_wrapped;
+    if (!wrapped) return;
+    const master = await decryptSecretWithPassword(wrapped, `${login}:${currentPassword}`);
+    const next = await encryptSecretWithPassword(master, `${login}:${newPassword}`);
+    await supabase().from('profiles').update({ master_key_wrapped: next }).eq('id', userId);
+  } catch (error) {
+    console.warn('master key rewrap failed', safeError(error));
+  }
 }
 
 /**
@@ -2673,6 +2855,44 @@ export function hasMyPrivateKey(userId: string): boolean {
   return getPrivateKey(userId) !== null;
 }
 
+export async function syncMasterHistory(
+  userId: string,
+  login: string,
+  password: string,
+): Promise<boolean> {
+  const pass = `${login}:${password}`;
+  const rows = (await unwrap(
+    supabase().from('profiles').select('master_key_wrapped,private_key_master').eq('id', userId).limit(1),
+  )) as Array<{ master_key_wrapped?: string; private_key_master?: string }>;
+  const row = (rows ?? [])[0] ?? {};
+  let masterKeyB64 = '';
+  if (row.master_key_wrapped) {
+    masterKeyB64 = await decryptSecretWithPassword(row.master_key_wrapped, pass);
+  } else {
+    masterKeyB64 = generateMasterKey();
+    const wrapped = await encryptSecretWithPassword(masterKeyB64, pass);
+    await supabase().from('profiles').update({ master_key_wrapped: wrapped }).eq('id', userId);
+  }
+  let restored = false;
+  if (row.private_key_master) {
+    const json = await decryptWithMasterKey(row.private_key_master, masterKeyB64);
+    savePrivateKey(userId, JSON.parse(json) as JsonWebKey);
+    restored = true;
+  } else {
+    const jwk = getPrivateKey(userId);
+    if (jwk) {
+      const encrypted = await encryptWithMasterKey(JSON.stringify(jwk), masterKeyB64);
+      await supabase().from('profiles').update({ private_key_master: encrypted }).eq('id', userId);
+    }
+  }
+  try {
+    sessionStorage.setItem(`svyaz.master.`, masterKeyB64);
+  } catch {
+    /* приватный режим */
+  }
+  return restored;
+}
+
 export async function getMyKeyStatus(userId: string): Promise<KeyPairStatus> {
   const user = await getUserById(userId);
   return getKeyPairStatus(userId, user?.publicKeyJwk);
@@ -3234,5 +3454,8 @@ export async function adminImportUsers(
   }
   return { created, failed };
 }
+
+
+
 
 

@@ -806,7 +806,7 @@ function MessageBubbleBase({
   const deleted = msg.deleted === true;
 
   return (
-    <div className={`bubble-in flex flex-col ${own ? 'items-end' : 'items-start'}`}>
+    <div data-msg-id={msg.id} className={`bubble-in flex flex-col ${own ? 'items-end' : 'items-start'}`}>
       <div
         onPointerDown={(e) => {
           if (e.pointerType === 'mouse' && e.button !== 0) return;
@@ -1271,4 +1271,5 @@ function PollContent({ poll, messageId }: { poll: Poll; messageId: string }) {
     </div>
   );
 }
+
 
