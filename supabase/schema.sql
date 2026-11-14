@@ -1621,6 +1621,9 @@ create policy participants_insert on public.chat_participants for insert
          where c.id = chat_id and c.owner_id = public.current_user_id()
       )
       or public.is_chat_member(chat_id, public.current_user_id())
+      or not exists (
+        select 1 from public.chat_participants p where p.chat_id = chat_participants.chat_id
+      )
     )
   );
 
