@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { useNavigate, Navigate } from 'react-router-dom';
 import {
@@ -254,7 +254,7 @@ function DashboardTab() {
             <div key={a.label} className="flex min-w-0 flex-1 flex-col items-center gap-1">
               <div className="tabular-nums text-[11px] text-text-muted">{a.count}</div>
               <div
-                className="w-full rounded-t bg-accent/60"
+                className="w-full rounded-t bg-[#2563eb]"
                 style={{ height: `${Math.max(4, (a.count / maxCount) * 88)}px` }}
                 title={`${a.label}: ${a.count}`}
               />
@@ -314,8 +314,8 @@ function MonthChart({
         <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="Активность за 30 дней">
           <defs>
             <linearGradient id="adminActivityFill" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.35" />
-              <stop offset="100%" stopColor="var(--accent)" stopOpacity="0.02" />
+              <stop offset="0%" stopColor="#2563eb" stopOpacity="0.35" />
+              <stop offset="100%" stopColor="#2563eb" stopOpacity="0.02" />
             </linearGradient>
           </defs>
           {[0.25, 0.5, 0.75].map((k) => (
@@ -325,7 +325,7 @@ function MonthChart({
               x2={W - padX}
               y1={baseY - k * (H - 50)}
               y2={baseY - k * (H - 50)}
-              stroke="var(--border)"
+              stroke="#cbd5e1"
               strokeDasharray="3 4"
             />
           ))}
@@ -333,14 +333,14 @@ function MonthChart({
           <polyline
             points={line}
             fill="none"
-            stroke="var(--accent)"
-            strokeWidth="2.5"
+            stroke="#2563eb"
+            strokeWidth="3"
             strokeLinejoin="round"
             strokeLinecap="round"
           />
           {coords.map((c) =>
             c.count === max && max > 0 ? (
-              <circle key={`p-${c.day}`} cx={c.x} cy={c.y} r="3.5" fill="var(--accent)" />
+              <circle key={`p-${c.day}`} cx={c.x} cy={c.y} r="3.5" fill="#2563eb" />
             ) : null,
           )}
           {labels.map((c) => (
@@ -350,7 +350,7 @@ function MonthChart({
               y={H - 4}
               textAnchor={c.x < 30 ? 'start' : c.x > W - 30 ? 'end' : 'middle'}
               fontSize="10"
-              fill="var(--text-muted)"
+              fill="#64748b"
             >
               {c.day}
             </text>
@@ -895,7 +895,7 @@ function UsersTab({
                   </div>
                   {editAutoRank ? (
                     <div className="flex items-center gap-2 rounded-lg border border-accent/40 bg-accent/10 px-3 py-2">
-                      <RankBadge rank={editRank} size="sm" />
+                      <RankBadge rank={editRank} size="xs" />
                       <span className="text-[13px] text-text">
                         {editRank || 'не определено'}
                         <span className="ml-1.5 text-[11px] text-text-muted">
@@ -919,7 +919,7 @@ function UsersTab({
                             }`}
                             aria-pressed={active}
                           >
-                            <RankBadge rank={r} size="sm" />
+                            <RankBadge rank={r} size="xs" />
                             <span
                               className={`w-full truncate text-center text-[11px] leading-tight ${
                                 active ? 'font-medium text-accent' : 'text-text-muted'
@@ -1940,3 +1940,6 @@ function SecurityTab() {
     </div>
   );
 }
+
+
+

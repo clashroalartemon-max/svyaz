@@ -443,7 +443,7 @@ export function ProfilePage() {
               {!chat?.saved &&
                 peer?.rank &&
                 !/^рядовой(\s+полиции)?$/i.test(peer.rank.trim()) && (
-                  <RankBadge rank={peer.rank} size="sm" />
+                  <RankBadge rank={peer.rank} size="xs" />
                 )}
             </div>
             <div className="truncate text-[13px] text-text-muted">
@@ -499,7 +499,7 @@ export function ProfilePage() {
                 ? visible.filter((m) => m.type === 'voice').length
                 : key === 'circle'
                   ? visible.filter((m) => m.type === 'circle').length
-                  : visible.filter((m) => m.type === 'text').length;
+                  : -1;
           return (
             <button
               key={key}
@@ -550,7 +550,9 @@ function LinkListView({ messages, myId, onOpen }: { messages: Message[]; myId: s
       // Расшифровываем последовательно, чтобы не перегружать сеть
       for (const m of texts) {
         const t = await db.readMessageText(m, myId);
-        if (alive && t && extractLinks(t).length > 0) out.push({ id: m.id, text: t });
+        if (alive && t && !t.includes('Зашифровано') && extractLinks(t).length > 0) {
+          out.push({ id: m.id, text: t });
+        }
       }
       setItems(out);
     })();
@@ -585,6 +587,9 @@ function LinkListView({ messages, myId, onOpen }: { messages: Message[]; myId: s
     </div>
   );
 }
+
+
+
 
 
 

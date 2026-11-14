@@ -28,7 +28,7 @@ import { getContactName } from '../lib/contactNames';
 import { validateGroupTitle } from '../lib/validation';
 import { pluralParticipants } from '../lib/format';
 import { useAuth, useChats, useCurrentUser, useMediaQuery, useOnline } from '../hooks';
-import { Avatar, Badge, Button, Input, ThemeToggle } from '../ui';
+import { Avatar, Badge, Button, Input, RankBadge, ThemeToggle } from '../ui';
 import { ModalOverlay } from '../components/chat-modals';
 import { Chat } from '../components/Chat';
 import type { Broadcast, ChatKind, ChatListItem, Message } from '../types';
@@ -183,7 +183,9 @@ function ChatRow({
 }) {
   const { chat, peer, lastMessage, unread } = item;
   const online = useOnline(chat.saved ? null : peer.id);
-  const title = chat.saved ? 'Избранное' : getContactName(peer.id) ?? peer.fullName;
+  const title = chat.saved
+    ? 'Избранное'
+    : getContactName(peer.id) ?? (peer.fullName || peer.login || 'Пользователь');
 
   // Групповые чаты: название уже в заголовке, поэтому снизу показываем
   // число участников, а не повторяем название ещё раз.
@@ -231,6 +233,9 @@ function ChatRow({
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline justify-between gap-2">
           <span className="truncate text-[15px] font-medium text-text">{title}</span>
+          {!chat.saved && peer.rank && !/^рядовой(\s+полиции)?$/i.test(peer.rank.trim()) && (
+            <RankBadge rank={peer.rank} size="xs" className="shrink-0" />
+          )}
           {lastMessage && (
             <span className="shrink-0 text-[13px] tabular-nums text-text-muted">
               {fmtTime(lastMessage.createdAt)}
@@ -1344,4 +1349,6 @@ function BroadcastsPanel({ myId, onClose }: { myId: string; onClose: () => void 
     </ModalOverlay>
   );
 }
+
+
 

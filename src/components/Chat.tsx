@@ -132,7 +132,7 @@ function normalizeWaveform(values: number[], buckets = WAVEFORM_BUCKETS): number
 
 function shortName(full: string): string {
   const parts = full.trim().split(/\s+/);
-  return parts.length >= 2 ? ` ` : full;
+  return parts.length >= 2 ? parts[0] + ' ' + parts[1] : full;
 }
 
 function fmtTimer(sec: number): string {
@@ -1246,7 +1246,7 @@ export function Chat({ chatId, showBack = false }: ChatProps) {
               <div className="flex min-w-0 items-center gap-1.5">
                 <span className="truncate text-[15px] font-medium text-text">{title}</span>
                 {!isSaved && peer.rank && !/^рядовой(\s+полиции)?$/i.test(peer.rank.trim()) && (
-                  <RankBadge rank={peer.rank} size="sm" />
+                  <RankBadge rank={peer.rank} size="xs" className="shrink-0" />
                 )}
               </div>
               <div
@@ -1970,6 +1970,8 @@ function MenuButton({
     </button>
   );
 }
+
+
 
 
 

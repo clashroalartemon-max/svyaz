@@ -1,4 +1,4 @@
-import { Info } from 'lucide-react';
+﻿import { Info } from 'lucide-react';
 import { useState } from 'react';
 import type { User } from '../types';
 import { RankBadge } from './RankBadge';
@@ -43,7 +43,7 @@ export function InfoButton({ user, title }: { user: User | null; title?: string 
           >
             <div className="mb-3 flex items-center gap-3">
               {user.rank ? (
-                <RankBadge rank={user.rank} title={user.rank} />
+                <RankBadge rank={user.rank} size="xs" title={user.rank} />
               ) : (
                 <span className="text-[13px] text-text-muted">Без звания</span>
               )}
