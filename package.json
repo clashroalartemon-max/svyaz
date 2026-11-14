@@ -8,6 +8,9 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "serve": "vite preview --port 4173 --strictPort",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "loadtest": "node scripts/load-test.mjs",
     "tunnel": "npx waytunnel --port 5173",
     "tunnel:prod": "npx waytunnel --port 4173",
     "tunnel:alt": "npx -y tunnelmole 5173"
@@ -22,6 +25,7 @@
     "react-router-dom": "^6.30.6"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.16",
     "@types/react": "^18.3.31",
     "@types/react-dom": "^18.3.7",
     "@vitejs/plugin-react": "^6.3.0",
@@ -30,6 +34,7 @@
     "tailwindcss": "^3.4.19",
     "typescript": "^5.9.3",
     "vite": "^8.3.8",
+    "vitest": "^5.1.0",
     "waytunnel": "^0.1.1"
   }
 }

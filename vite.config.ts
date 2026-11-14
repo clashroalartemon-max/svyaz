@@ -4,6 +4,21 @@ import react from '@vitejs/plugin-react';
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [react()],
+  build: {
+    // Разделяем вендоров: стартовый чанк остаётся компактным, а браузер
+    // кэширует React/Supabase/иконки отдельно между обновлениями.
+    rolldownOptions: {
+      output: {
+        manualChunks(id: string) {
+          if (!id.includes('node_modules')) return undefined;
+          if (id.includes('@supabase')) return 'vendor-supabase';
+          if (id.includes('lucide-react')) return 'vendor-icons';
+          if (id.includes('react')) return 'vendor-react';
+          return 'vendor';
+        },
+      },
+    },
+  },
   server: {
     // host: true — слушаем все интерфейсы, чтобы открыть приложение с телефона
     // по http://<IP-компьютера>:5173 (см. README)
