@@ -70,6 +70,16 @@ do $$ begin
     alter table public.profiles add column if not exists phone text;
   exception when duplicate_column then null;
   end;
+
+  -- Короткий статус («На учёбе», «В наряде», «Свободен») и «О себе».
+  begin
+    alter table public.profiles add column if not exists status text;
+  exception when duplicate_column then null;
+  end;
+  begin
+    alter table public.profiles add column if not exists bio text;
+  exception when duplicate_column then null;
+  end;
 end $$;
 
 -- Миграция: если колонка ошибочно называлась rank — переименовываем в military_rank.
@@ -123,6 +133,16 @@ create table if not exists public.credentials (
   profile_id uuid primary key references public.profiles(id) on delete cascade,
   password_hash text not null
 );
+
+-- Сессионные токены: клиент присылает x-session-token, RLS проверяет его.
+-- В таблице хранится только SHA-256 токена; сам токен есть лишь у клиента.
+create table if not exists public.auth_tokens (
+  token_hash text primary key,
+  user_id uuid not null references public.profiles(id) on delete cascade,
+  created_at bigint not null default (extract(epoch from now()) * 1000)::bigint,
+  expires_at bigint not null
+);
+create index if not exists auth_tokens_user_idx on public.auth_tokens (user_id);
 
 do $$
 begin
@@ -346,8 +366,18 @@ create index if not exists chat_archive_user_idx on public.chat_archive (user_id
 -- (см. src/lib/supabase.ts). Политики читают его отсюда.
 
 create or replace function public.current_user_id() returns uuid
-language sql stable as $$
-  select nullif(coalesce(current_setting('request.headers', true)::json ->> 'x-user-id', ''), '')::uuid
+language sql stable security definer set search_path = public as $$
+  select t.user_id
+    from public.auth_tokens t
+   where t.token_hash = encode(
+           sha256(convert_to(
+             coalesce(nullif(current_setting('request.headers', true), '')::json ->> 'x-session-token', ''),
+             'UTF8'
+           )),
+           'hex'
+         )
+     and t.expires_at > (extract(epoch from now()) * 1000)::bigint
+   limit 1
 $$;
 
 -- Участник чата? SECURITY DEFINER — чтобы не было рекурсии политик.
@@ -395,9 +425,58 @@ begin
      set password_hash = lower(trim(p_new_hash))
    where profile_id = p_profile
      and lower(password_hash) = lower(trim(p_current_hash));
+  if found then
+    -- Пароль сменился — старые сессии больше не действуют.
+    delete from public.auth_tokens where user_id = p_profile;
+  end if;
   return found;
 end;
 $$;
+
+-- Выдать токен после проверки пароля. Токен существует только у клиента,
+-- в базе лежит его SHA-256.
+create or replace function public.issue_session_token(p_login text, p_hash text)
+returns text
+language plpgsql security definer set search_path = public as $$
+declare
+  v_user uuid;
+  v_token text;
+begin
+  select c.profile_id into v_user
+    from public.credentials c
+    join public.profiles p on p.id = c.profile_id
+   where p.login = lower(trim(p_login))
+     and lower(trim(c.password_hash)) = lower(trim(p_hash))
+   limit 1;
+  if v_user is null then
+    raise exception 'invalid credentials';
+  end if;
+
+  v_token := replace(gen_random_uuid()::text, '-', '')
+          || replace(gen_random_uuid()::text, '-', '');
+  insert into public.auth_tokens (token_hash, user_id, expires_at)
+  values (
+    encode(sha256(convert_to(v_token, 'UTF8')), 'hex'),
+    v_user,
+    (extract(epoch from now()) * 1000)::bigint + 30::bigint * 24 * 60 * 60 * 1000
+  );
+  return v_token;
+end;
+$$;
+
+grant execute on function public.issue_session_token(text, text) to anon, authenticated;
+
+create or replace function public.revoke_session_token(p_token text)
+returns boolean
+language plpgsql security definer set search_path = public as $$
+begin
+  delete from public.auth_tokens
+   where token_hash = encode(sha256(convert_to(coalesce(p_token, ''), 'UTF8')), 'hex');
+  return found;
+end;
+$$;
+
+grant execute on function public.revoke_session_token(text) to anon, authenticated;
 
 -- 3b. Админ-функции -------------------------------------------------------------
 -- Все действия выполняются админом; роль проверяется по current_user_id().
@@ -996,8 +1075,15 @@ create table if not exists public.app_settings (
 insert into public.app_settings (key, value) values
   ('registration_enabled', 'false'),
   ('chats_disabled', 'false'),
-  ('main_admin_id', '')
+  ('main_admin_id', ''),
+  ('schema_features', 'admin_activity,load_test,rpc_status,rpc_hide,rpc_key,merge_chats,auth_tokens,profile_social')
 on conflict (key) do nothing;
+
+-- Обновляем список фич при повторном запуске схемы (остальные настройки
+-- пользователя не перезаписываем).
+update public.app_settings
+   set value = 'admin_activity,load_test,rpc_status,rpc_hide,rpc_key,merge_chats,auth_tokens,profile_social'
+ where key = 'schema_features';
 
 -- 4. Наполнение базы -----------------------------------------------------------
 -- Создаёт admin / admin12345 и cadet001..cadet200 / test1234.
@@ -1175,6 +1261,7 @@ $$;
 
 alter table public.profiles enable row level security;
 alter table public.credentials enable row level security;
+alter table public.auth_tokens enable row level security;
 alter table public.chats enable row level security;
 alter table public.chat_participants enable row level security;
 alter table public.messages enable row level security;
@@ -1279,6 +1366,11 @@ drop policy if exists read_state_all on public.read_state;
 create policy read_state_all on public.read_state for all
   using (user_id = public.current_user_id())
   with check (user_id = public.current_user_id());
+
+-- Отметки прочтения участников чата видны друг другу (для «кто прочитал»).
+drop policy if exists read_state_members_select on public.read_state;
+create policy read_state_members_select on public.read_state for select
+  using (public.is_chat_member(chat_id, public.current_user_id()));
 
 -- presence
 drop policy if exists presence_select on public.presence;
@@ -1388,3 +1480,397 @@ drop policy if exists svyaz_media_update on storage.objects;
 create policy svyaz_media_update on storage.objects for update
   using (bucket_id = 'media');
 
+-- 9. Объединение дублей авточатов ------------------------------------------------
+-- Один и тот же чат взвода/курса мог создаться дважды (разные id и target).
+-- Функция переносит сообщения и участников в самый полный чат и удаляет дубли.
+create or replace function public.admin_merge_duplicate_chats()
+returns integer
+language plpgsql security definer set search_path = public as $$
+declare
+  rec record;
+  v_keeper uuid;
+  v_chat uuid;
+  v_removed integer := 0;
+begin
+  for rec in
+    select
+      c.kind,
+      coalesce(nullif(regexp_replace(coalesce(c.target, c.title, ''), '\D', '', 'g'), ''), '') as grp
+    from public.chats c
+    where c.kind in ('squad', 'group', 'course', 'teachers')
+    group by 1, 2
+    having count(*) > 1
+  loop
+    select c.id into v_keeper
+      from public.chats c
+     where c.kind = rec.kind
+       and coalesce(nullif(regexp_replace(coalesce(c.target, c.title, ''), '\D', '', 'g'), ''), '') = rec.grp
+     order by (select count(*) from public.messages m where m.chat_id = c.id) desc,
+              c.created_at asc
+     limit 1;
+
+    for v_chat in
+      select c.id from public.chats c
+       where c.kind = rec.kind
+         and c.id <> v_keeper
+         and coalesce(nullif(regexp_replace(coalesce(c.target, c.title, ''), '\D', '', 'g'), ''), '') = rec.grp
+    loop
+      update public.messages set chat_id = v_keeper where chat_id = v_chat;
+
+      insert into public.chat_participants (chat_id, user_id)
+        select v_keeper, user_id from public.chat_participants where chat_id = v_chat
+        on conflict do nothing;
+
+      insert into public.read_state (chat_id, user_id, last_read_at)
+        select v_keeper, user_id, last_read_at from public.read_state where chat_id = v_chat
+        on conflict (chat_id, user_id) do update
+          set last_read_at = greatest(public.read_state.last_read_at, excluded.last_read_at);
+
+      delete from public.chats where id = v_chat;
+      v_removed := v_removed + 1;
+    end loop;
+  end loop;
+
+  return v_removed;
+end;
+$$;
+
+grant execute on function public.admin_merge_duplicate_chats() to anon, authenticated;
+
+-- 10. Активность за месяц для дашборда -------------------------------------------
+create or replace function public.admin_activity(p_days integer default 30)
+returns table(day text, count integer)
+language sql security definer set search_path = public as $$
+  with span as (
+    select generate_series(
+      current_date - (greatest(1, least(365, coalesce(p_days, 30))) - 1),
+      current_date,
+      interval '1 day'
+    )::date as d
+  )
+  select to_char(s.d, 'DD.MM') as day,
+         coalesce(count(m.id), 0)::int as count
+    from span s
+    left join public.messages m
+      on m.created_at >= (extract(epoch from s.d) * 1000)::bigint
+     and m.created_at < (extract(epoch from (s.d + 1)) * 1000)::bigint
+   group by s.d
+   order by s.d;
+$$;
+
+grant execute on function public.admin_activity(integer) to anon, authenticated;
+
+-- 11. Индексы под нагрузку --------------------------------------------------------
+create index if not exists messages_created_idx on public.messages (created_at desc);
+create index if not exists messages_sender_idx on public.messages (sender_id);
+create index if not exists messages_type_idx on public.messages (type);
+create index if not exists broadcasts_created_idx on public.broadcasts (created_at desc);
+create index if not exists profiles_group_idx on public.profiles (group_name);
+create index if not exists profiles_position_idx on public.profiles (position);
+create index if not exists contacts_user_idx on public.contacts (user_id);
+
+-- 12. Защита зашифрованного приватного ключа --------------------------------------
+-- profiles читается всеми (справочник), но encrypted_private_key не должен
+-- уходить даже в зашифрованном виде: иначе возможен офлайн-подбор пароля.
+revoke select on public.profiles from anon, authenticated;
+revoke insert on public.profiles from anon, authenticated;
+revoke update on public.profiles from anon, authenticated;
+
+grant select (
+  id, login, full_name, group_name, role, military_rank, position,
+  role_level, username, public_key_jwk, avatar_url, department, phone, created_at
+) on public.profiles to anon, authenticated;
+
+grant insert (
+  id, login, full_name, group_name, role, military_rank, position,
+  role_level, username, public_key_jwk, encrypted_private_key,
+  avatar_url, department, phone, created_at
+) on public.profiles to anon, authenticated;
+
+grant update (
+  full_name, group_name, role, military_rank, position, role_level,
+  username, public_key_jwk, encrypted_private_key, avatar_url, department, phone
+) on public.profiles to anon, authenticated;
+
+grant delete on public.profiles to anon, authenticated;
+
+-- Выдать зашифрованный ключ только владельцу, подтвердившему пароль.
+create or replace function public.get_encrypted_key(p_profile uuid, p_hash text)
+returns text
+language sql security definer set search_path = public as $$
+  select p.encrypted_private_key
+    from public.profiles p
+    join public.credentials c on c.profile_id = p.id
+   where p.id = p_profile
+     and lower(trim(c.password_hash)) = lower(trim(p_hash))
+   limit 1
+$$;
+
+grant execute on function public.get_encrypted_key(uuid, text) to anon, authenticated;
+
+-- 13. Ужесточение RLS -------------------------------------------------------------
+-- Раньше любой авторизованный мог добавить себя в чужой чат и прочитать его.
+-- Теперь добавлять участников может владелец чата или уже действующий участник.
+drop policy if exists participants_insert on public.chat_participants;
+create policy participants_insert on public.chat_participants for insert
+  with check (
+    public.current_user_id() is not null
+    and (
+      exists (
+        select 1 from public.chats c
+         where c.id = chat_id and c.owner_id = public.current_user_id()
+      )
+      or public.is_chat_member(chat_id, public.current_user_id())
+    )
+  );
+
+-- Владелец чата при создании — только сам автор.
+drop policy if exists chats_insert on public.chats;
+create policy chats_insert on public.chats for insert
+  with check (
+    public.current_user_id() is not null
+    and (owner_id is null or owner_id = public.current_user_id())
+  );
+
+-- Сообщения: автор — только текущий пользователь, править/удалять может только автор.
+drop policy if exists messages_insert on public.messages;
+create policy messages_insert on public.messages for insert
+  with check (
+    sender_id = public.current_user_id()
+    and public.is_chat_member(chat_id, public.current_user_id())
+  );
+
+drop policy if exists messages_update on public.messages;
+create policy messages_update on public.messages for update
+  using (sender_id = public.current_user_id());
+
+drop policy if exists messages_delete on public.messages;
+create policy messages_delete on public.messages for delete
+  using (sender_id = public.current_user_id());
+
+-- Медиа: добавлять файл можно только к своему сообщению.
+drop policy if exists media_write on public.media;
+create policy media_write on public.media for insert
+  with check (
+    exists (
+      select 1 from public.messages m
+       where m.id = msg_id and m.sender_id = public.current_user_id()
+    )
+  );
+
+-- --- операции, которые раньше делались прямыми UPDATE -------------------------
+
+-- Отметить входящие доставленными (sent → delivered).
+create or replace function public.mark_delivered(p_user uuid)
+returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if p_user is null or p_user <> public.current_user_id() then
+    return;
+  end if;
+  update public.messages m
+     set status = 'delivered'
+    from public.chat_participants cp
+   where cp.user_id = p_user
+     and cp.chat_id = m.chat_id
+     and m.sender_id <> p_user
+     and m.status = 'sent';
+end;
+$$;
+
+-- Отметить чат прочитанным и записать last_read_at.
+create or replace function public.mark_chat_read(p_chat uuid, p_user uuid)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  v_last bigint;
+begin
+  if p_chat is null or p_user is null or p_user <> public.current_user_id() then
+    return;
+  end if;
+  if not public.is_chat_member(p_chat, p_user) then
+    return;
+  end if;
+
+  update public.messages
+     set status = 'read'
+   where chat_id = p_chat
+     and sender_id <> p_user
+     and status <> 'read';
+
+  select max(created_at) into v_last from public.messages where chat_id = p_chat;
+  insert into public.read_state (chat_id, user_id, last_read_at)
+    values (p_chat, p_user, coalesce(v_last, (extract(epoch from now()) * 1000)::bigint))
+  on conflict (chat_id, user_id) do update
+    set last_read_at = greatest(public.read_state.last_read_at, excluded.last_read_at);
+end;
+$$;
+
+-- Скрыть одно сообщение только для себя.
+create or replace function public.hide_message(p_msg uuid, p_user uuid)
+returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if p_msg is null or p_user is null or p_user <> public.current_user_id() then
+    return;
+  end if;
+  update public.messages m
+     set deleted_for = array_append(m.deleted_for, p_user)
+   where m.id = p_msg
+     and not (p_user = any(m.deleted_for))
+     and public.is_chat_member(m.chat_id, p_user);
+end;
+$$;
+
+-- Скрыть всю историю чата только для себя (остальным сообщения остаются).
+create or replace function public.hide_chat(p_chat uuid, p_user uuid)
+returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if p_chat is null or p_user is null or p_user <> public.current_user_id() then
+    return;
+  end if;
+  if not public.is_chat_member(p_chat, p_user) then
+    return;
+  end if;
+
+  update public.messages m
+     set deleted_for = array_append(m.deleted_for, p_user)
+   where m.chat_id = p_chat
+     and not (p_user = any(m.deleted_for));
+
+  delete from public.read_state where chat_id = p_chat and user_id = p_user;
+end;
+$$;
+
+grant execute on function public.mark_delivered(uuid) to anon, authenticated;
+grant execute on function public.mark_chat_read(uuid, uuid) to anon, authenticated;
+grant execute on function public.hide_message(uuid, uuid) to anon, authenticated;
+grant execute on function public.hide_chat(uuid, uuid) to anon, authenticated;
+
+-- Самопроверка RLS: запускать под ролью anon после set_config('request.headers').
+-- Возвращает список проверок и результат pass/fail.
+create or replace function public.security_selftest()
+returns table(test text, passed boolean)
+language plpgsql security invoker set search_path = public as $$
+declare
+  v_a uuid := public.current_user_id();
+  v_foreign uuid;
+  v_ok boolean;
+begin
+  select cp.chat_id into v_foreign
+    from public.chat_participants cp
+   where cp.user_id <> v_a
+     and not exists (
+       select 1 from public.chat_participants x
+        where x.chat_id = cp.chat_id and x.user_id = v_a
+     )
+   limit 1;
+
+  return query select 'foreign_chat_found', v_foreign is not null;
+  return query select 'foreign_messages_hidden',
+    coalesce((select count(*) from public.messages where chat_id = v_foreign) = 0, true);
+  return query select 'foreign_media_hidden',
+    coalesce((
+      select count(*) from public.media md
+        join public.messages m on m.id = md.msg_id
+       where m.chat_id = v_foreign
+    ) = 0, true);
+  return query select 'credentials_hidden',
+    (select count(*) from public.credentials) = 0;
+  return query select 'private_key_column_hidden',
+    not has_column_privilege('anon', 'public.profiles', 'encrypted_private_key', 'SELECT');
+
+  begin
+    insert into public.chat_participants (chat_id, user_id)
+      values (v_foreign, v_a);
+    return query select 'cannot_join_foreign_chat', false;
+  exception when others then
+    return query select 'cannot_join_foreign_chat', true;
+  end;
+
+  begin
+    insert into public.messages (id, chat_id, sender_id, ciphertext, iv, status, created_at)
+      values (gen_random_uuid(), v_foreign, v_a, 'x', 'y', 'sent', 0);
+    return query select 'cannot_spoof_message', false;
+  exception when others then
+    return query select 'cannot_spoof_message', true;
+  end;
+end;
+$$;
+
+grant execute on function public.security_selftest() to anon, authenticated;
+
+-- 14. Удаление пользователя не уносит чужие чаты --------------------------------
+-- Раньше chats.owner_id ссылался на profiles с ON DELETE CASCADE: удаление
+-- курсанта удаляло созданные им групповые чаты у всех участников.
+do $$
+declare c record;
+begin
+  for c in
+    select conname
+      from pg_constraint
+     where conrelid = 'public.chats'::regclass
+       and contype = 'f'
+       and pg_get_constraintdef(oid) like '%owner_id%'
+  loop
+    execute format('alter table public.chats drop constraint %I', c.conname);
+  end loop;
+
+  alter table public.chats
+    add constraint chats_owner_id_fkey
+    foreign key (owner_id) references public.profiles(id) on delete set null;
+end $$;
+
+
+-- 16. Идемпотентные права доступа и бакет аватарок ---------------------------
+-- Выполняйте этот блок, если видите «permission denied for table ...».
+grant usage on schema public to anon, authenticated;
+grant select, insert, update, delete on all tables in schema public to anon, authenticated;
+
+-- profiles: приватный ключ и хеши не должны читаться напрямую.
+revoke select, insert, update on public.profiles from anon, authenticated;
+
+grant select (
+  id, login, full_name, group_name, role, military_rank, position,
+  role_level, username, public_key_jwk, avatar_url, department, phone,
+  status, bio, created_at
+) on public.profiles to anon, authenticated;
+
+grant insert (
+  id, login, full_name, group_name, role, military_rank, position,
+  role_level, username, public_key_jwk, encrypted_private_key,
+  avatar_url, department, phone, status, bio, created_at
+) on public.profiles to anon, authenticated;
+
+grant update (
+  full_name, group_name, role, military_rank, position, role_level,
+  username, public_key_jwk, encrypted_private_key, avatar_url,
+  department, phone, status, bio
+) on public.profiles to anon, authenticated;
+
+grant delete on public.profiles to anon, authenticated;
+
+-- Пароли и токены доступны только SECURITY DEFINER-функциям.
+revoke all on public.credentials from anon, authenticated;
+revoke all on public.auth_tokens from anon, authenticated;
+
+insert into storage.buckets (id, name, public)
+values ('avatars', 'avatars', true)
+on conflict (id) do update set public = true;
+
+drop policy if exists svyaz_avatars_read on storage.objects;
+create policy svyaz_avatars_read on storage.objects for select
+  using (bucket_id = 'avatars');
+
+drop policy if exists svyaz_avatars_insert on storage.objects;
+create policy svyaz_avatars_insert on storage.objects for insert
+  with check (bucket_id = 'avatars');
+
+drop policy if exists svyaz_avatars_update on storage.objects;
+create policy svyaz_avatars_update on storage.objects for update
+  using (bucket_id = 'avatars');
+
+drop policy if exists svyaz_avatars_delete on storage.objects;
+create policy svyaz_avatars_delete on storage.objects for delete
+  using (bucket_id = 'avatars');

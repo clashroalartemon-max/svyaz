@@ -1,0 +1,191 @@
+--- C:\Temp\gigatool\refactor-before\Chat.tsx
++++ src\components\Chat.tsx
+@@ -55,6 +55,10 @@
+   return db.uid();
+ }
+ 
++/** Единые тексты ошибок и MIME по умолчанию — без повторов в трёх местах. */
++const PARTICIPANTS_ERROR = 'не удалось определить участников чата';
++const DEFAULT_MEDIA_MIME = 'application/octet-stream';
++
+ function pickMimeType(kind: 'audio' | 'video'): string {
+   const candidates =
+     kind === 'audio'
+@@ -411,12 +415,12 @@
+    * (старая база, сбой генерации), она создаётся на месте — отправка не падает
+    * с «приватный ключ не найден».
+    */
+-  const resolveKeys = async (): Promise<{ me: User; peer: User } | null> => {
++  const resolveKeys = useCallback(async (): Promise<{ me: User; peer: User } | null> => {
+     if (!myId || !me || !peer) return null;
+     const freshMe = (await db.ensureUserKeyPair(myId)) ?? me;
+     const freshPeer = (await db.ensureUserKeyPair(peer.id)) ?? peer;
+     return { me: freshMe, peer: freshPeer };
+-  };
++  }, [myId, me, peer]);
+ 
+   /** Кэш публичных ключей участников группы: не дёргаем сеть на каждое сообщение. */
+   const groupMembersRef = useRef<{
+@@ -425,7 +429,9 @@
+   } | null>(null);
+ 
+   /** Все участники группового чата с публичными ключами (для E2EE в группе) */
+-  const resolveGroupMembers = async (): Promise<Array<{ id: string; publicKeyJwk: JsonWebKey }> | null> => {
++  const resolveGroupMembers = useCallback(async (): Promise<
++    Array<{ id: string; publicKeyJwk: JsonWebKey }> | null
++  > => {
+     if (!chat || !chat.participants || chat.participants.length === 0) return null;
+     const cacheKey = chat.participants.join(',');
+     if (groupMembersRef.current?.key === cacheKey) return groupMembersRef.current.members;
+@@ -443,9 +449,40 @@
+     if (members.length === 0) return null;
+     groupMembersRef.current = { key: cacheKey, members };
+     return members;
+-  };
++  }, [chat, myId]);
+ 
+   /**
++   * Один путь шифрования для текста, правки и медиа: убирает три копии
++   * одинаковой ветки «группа/личный чат» и заодно мемоизирует зависимости.
++   */
++  const encryptForChat = useCallback(
++    async (data: string | ArrayBuffer) => {
++      if (!myId) throw new Error('не удалось определить автора');
++      if (isGroup) {
++        const members = await resolveGroupMembers();
++        if (!members) throw new Error(PARTICIPANTS_ERROR);
++        const mine = members.find((member) => member.id === myId);
++        if (!mine) throw new Error(PARTICIPANTS_ERROR);
++        return encryptForGroup({
++          myId,
++          myPublicKeyJwk: mine.publicKeyJwk,
++          members,
++          data,
++        });
++      }
++      const keys = await resolveKeys();
++      if (!keys) throw new Error(PARTICIPANTS_ERROR);
++      return encryptFor({
++        myId,
++        myPublicKeyJwk: keys.me.publicKeyJwk,
++        peerPublicKeyJwk: keys.peer.publicKeyJwk,
++        data,
++      });
++    },
++    [isGroup, myId, resolveKeys, resolveGroupMembers],
++  );
++
++  /**
+    * Очередь исходящих текстовых сообщений: при быстрой отправке (или
+    * нагрузочном тесте) сообщения не теряются из-за флага «занято», а уходят
+    * строго по порядку.
+@@ -467,28 +504,8 @@
+       iv: '',
+     };
+     try {
+-      let fullMsg: Message;
+-      if (isGroup) {
+-        const members = await resolveGroupMembers();
+-        if (!members) throw new Error('не удалось определить участников чата');
+-        const group = await encryptForGroup({
+-          myId,
+-          myPublicKeyJwk: me!.publicKeyJwk,
+-          members,
+-          data: trimmed,
+-        });
+-        fullMsg = { ...optimisticMsg, ...group };
+-      } else {
+-        const keys = await resolveKeys();
+-        if (!keys) throw new Error('не удалось определить участников чата');
+-        const envelope = await encryptFor({
+-          myId,
+-          myPublicKeyJwk: keys.me.publicKeyJwk,
+-          peerPublicKeyJwk: keys.peer.publicKeyJwk,
+-          data: trimmed,
+-        });
+-        fullMsg = { ...optimisticMsg, ...envelope };
+-      }
++      const envelope = await encryptForChat(trimmed);
++      const fullMsg: Message = { ...optimisticMsg, ...envelope };
+       await db.saveMessageOptimistic(fullMsg, (e) => {
+         console.error('sendText optimistic error', e);
+       });
+@@ -557,28 +574,11 @@
+     if (!trimmed) return;
+     setBusy(true);
+     try {
+-      let patch: Parameters<typeof db.updateMessage>[1];
+-      if (isGroup) {
+-        const members = await resolveGroupMembers();
+-        if (!members) throw new Error('не удалось определить участников чата');
+-        const group = await encryptForGroup({
+-          myId,
+-          myPublicKeyJwk: me.publicKeyJwk,
+-          members,
+-          data: trimmed,
+-        });
+-        patch = { ...group, editedAt: Date.now() };
+-      } else {
+-        const keys = await resolveKeys();
+-        if (!keys) throw new Error('не удалось определить участников чата');
+-        const envelope = await encryptFor({
+-          myId,
+-          myPublicKeyJwk: keys.me.publicKeyJwk,
+-          peerPublicKeyJwk: keys.peer.publicKeyJwk,
+-          data: trimmed,
+-        });
+-        patch = { ...envelope, editedAt: Date.now() };
+-      }
++      const envelope = await encryptForChat(trimmed);
++      const patch: Parameters<typeof db.updateMessage>[1] = {
++        ...envelope,
++        editedAt: Date.now(),
++      };
+       await db.updateMessage(editing.id, patch);
+       setEditing(null);
+       setText('');
+@@ -606,29 +606,12 @@
+     setBusy(true);
+     try {
+       const buf = await blob.arrayBuffer();
+-      let envelope: Parameters<typeof db.saveMediaMessage>[1];
+-      let groupKeys: Message['groupKeys'];
+-      if (isGroup) {
+-        const members = await resolveGroupMembers();
+-        if (!members) throw new Error('не удалось определить участников чата');
+-        const group = await encryptForGroup({
+-          myId,
+-          myPublicKeyJwk: me.publicKeyJwk,
+-          members,
+-          data: buf,
+-        });
+-        envelope = group;
+-        groupKeys = group.groupKeys;
+-      } else {
+-        const keys = await resolveKeys();
+-        if (!keys) throw new Error('не удалось определить участников чата');
+-        envelope = await encryptFor({
+-          myId,
+-          myPublicKeyJwk: keys.me.publicKeyJwk,
+-          peerPublicKeyJwk: keys.peer.publicKeyJwk,
+-          data: buf,
+-        });
+-      }
++      const encrypted = await encryptForChat(buf);
++      const envelope: Parameters<typeof db.saveMediaMessage>[1] = encrypted;
++      const groupKeys: Message['groupKeys'] =
++        'groupKeys' in encrypted
++          ? (encrypted.groupKeys as Message['groupKeys'])
++          : undefined;
+       await db.saveMediaMessage(
+         {
+           id: newId(),
+@@ -636,7 +619,7 @@
+           senderId: myId,
+           type,
+           replyToId: replyTo?.id,
+-          mimeType: blob.type || 'application/octet-stream',
++          mimeType: blob.type || DEFAULT_MEDIA_MIME,
+           duration: extra?.duration,
+           waveform: extra?.waveform,
+           groupKeys,

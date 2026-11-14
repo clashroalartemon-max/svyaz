@@ -1,0 +1,16 @@
+2026-11-14T11:02:39.299Z Старт: 2 пользователей, префикс логинов simmwgaqzsy_
+2026-11-14T11:02:43.094Z регистрация: 1/2
+2026-11-14T11:02:43.362Z [001] verifyLogin…
+2026-11-14T11:03:53.635Z ОШИБКА simmwgaqzsy_001: TypeError: terminated
+2026-11-14T11:03:53.636Z [002] verifyLogin…
+2026-11-14T11:03:54.022Z [002] login ok
+2026-11-14T11:03:54.023Z [002] createGroupChat…
+2026-11-14T11:03:54.314Z [002] chat ok
+2026-11-14T11:03:54.566Z [002] keys ok
+2026-11-14T11:03:54.587Z [002] encrypt 1 ok, inserting…
+2026-11-14T11:04:13.791Z ОШИБКА simmwgaqzsy_002: TypeError: fetch failed
+2026-11-14T11:04:13.799Z ИТОГ: {"run":"simmwgaqzsy","requested":2,"registered":2,"loggedIn":1,"chats":1,"messages":0,"errors":2,"durationMs":94500,"prefix":"simmwgaqzsy_"}
+2026-11-14T11:04:13.800Z Ошибки (2):
+2026-11-14T11:04:13.800Z   {"stage":"flow","login":"simmwgaqzsy_001","error":"TypeError: terminated"}
+2026-11-14T11:04:13.801Z   {"stage":"flow","login":"simmwgaqzsy_002","error":"TypeError: fetch failed"}
+2026-11-14T11:04:13.801Z Учётные записи: логины simmwgaqzsy_001…simmwgaqzsy_002, пароль Test12345!
